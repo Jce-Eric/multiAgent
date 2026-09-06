@@ -32,6 +32,7 @@ export type GatewayEventType =
   | "interaction.question"
   | "interaction.permission"
   | "interaction.resolved"
+  | "agent.event"
   | "generation.started"
   | "generation.completed"
   | "generation.stopped"
@@ -50,9 +51,11 @@ export interface GatewayEvent<T = unknown> {
 export type InteractionType = "question" | "permission";
 
 export interface QuestionResponse {
-  answer: string;
+  answer?: string;
+  answers?: Record<string, string | number | boolean | string[]>;
 }
 
 export interface PermissionResponse {
-  decision: "allow" | "deny";
+  decision?: "allow" | "deny";
+  optionId?: string;
 }

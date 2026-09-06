@@ -8,12 +8,21 @@ const marker = (prompt: string, name: string): string | undefined => {
 };
 
 export class ReferenceEngine implements AgentEngine {
+  readonly capabilities = {
+    protocol: "reference",
+    nativeSessions: false,
+    questions: true,
+    permissions: true,
+    cancellation: true,
+  } as const;
+
   constructor(
     public readonly name: string,
     private readonly displayName: string,
   ) {}
 
   async generate(prompt: string, context: AgentRunContext): Promise<string> {
+    context.emitEvent("reference.run", { engine: this.name, directory: context.directory });
     const question = marker(prompt, "ask");
     const permission = marker(prompt, "permission");
     const errorMessage = marker(prompt, "error");

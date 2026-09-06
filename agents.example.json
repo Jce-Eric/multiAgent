@@ -1,0 +1,14 @@
+{
+  "engines": {
+    "my-acp-agent": {
+      "protocol": "acp",
+      "command": "my-agent --acp",
+      "displayName": "My ACP Agent"
+    },
+    "legacy-agent": {
+      "protocol": "jsonl",
+      "command": "node ./bridges/legacy-agent.js",
+      "displayName": "Legacy Agent"
+    }
+  }
+}

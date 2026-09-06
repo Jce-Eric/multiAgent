@@ -15,15 +15,24 @@ interface BridgeEvent {
 }
 
 export class ProcessBridgeEngine implements AgentEngine {
+  readonly capabilities = {
+    protocol: "jsonl",
+    nativeSessions: false,
+    questions: true,
+    permissions: true,
+    cancellation: true,
+  } as const;
+
   constructor(
     public readonly name: string,
     private readonly command: string,
+    private readonly env: NodeJS.ProcessEnv = process.env,
   ) {}
 
   async generate(prompt: string, context: AgentRunContext): Promise<string> {
     const child = spawn(this.command, {
       cwd: context.directory,
-      env: process.env,
+      env: this.env,
       shell: true,
       stdio: ["pipe", "pipe", "pipe"],
     });

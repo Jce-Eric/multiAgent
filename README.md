@@ -9,7 +9,7 @@ npm install
 npm start -- --engine codeagent --port 3000
 ```
 
-支持的引擎名称：`codeagent`、`opencode`、`deepseek-harness`。启动参数优先级为 `--engine` > `AGENT_ENGINE` > `codeagent`。
+内置引擎名称：`codeagent`、`opencode`、`deepseek-harness`。启动参数优先级为 `--engine` > `AGENT_ENGINE` > `codeagent`。
 
 未设置桥接命令时，服务使用可直接运行的内置参考引擎。设置下面任一环境变量后，对应引擎会切换为外部 JSONL 子进程适配器：
 
@@ -20,6 +20,24 @@ DEEPSEEK_HARNESS_COMMAND="my-deepseek-bridge"
 ```
 
 外部桥接协议见 [docs/engine-bridge.md](docs/engine-bridge.md)。
+
+### ACP Agent
+
+支持 Agent Client Protocol（ACP）v1 的 Agent 不需要为网关事件格式编写专用适配器。可以直接设置内置引擎的协议：
+
+```bash
+OPENCODE_PROTOCOL=acp \
+OPENCODE_COMMAND="your-acp-agent-command" \
+npm start -- --engine opencode
+```
+
+也可以使用配置文件注册任意新 Agent，无需修改 TypeScript 注册表：
+
+```bash
+AGENT_ENGINE_CONFIG=./agents.json npm start -- --engine my-agent
+```
+
+配置格式见 [agents.example.json](agents.example.json)，ACP 映射说明见 [docs/acp.md](docs/acp.md)。
 
 ## API
 
@@ -50,7 +68,7 @@ curl -X POST http://127.0.0.1:3000/v1/sessions \
 curl -N http://127.0.0.1:3000/v1/events
 ```
 
-发送消息后接口立即返回 `runId`，内容增量、反问、权限请求、完成、终止和失败均通过 SSE 推送。客户端也可以再次请求会话获取完整消息历史。
+发送消息后接口立即返回 `runId`，内容增量、反问、权限请求、完成、终止和失败均通过 SSE 推送。客户端也可以再次请求会话获取完整消息历史。Agent 未被统一建模的原生事件通过 `agent.event` 保留，避免适配时丢失工具调用、计划或用量信息。
 
 反问响应 body 为 `{"answer":"..."}`；权限响应 body 为 `{"decision":"allow"}` 或 `{"decision":"deny"}`。
 

@@ -10,6 +10,8 @@ export type ErrorCode =
   | "ENGINE_NOT_FOUND"
   | "ENGINE_PROTOCOL_ERROR"
   | "ENGINE_PROCESS_ERROR"
+  | "ENGINE_CONFIG_INVALID"
+  | "ENGINE_SESSION_ERROR"
   | "INTERNAL_ERROR";
 
 export class GatewayError extends Error {

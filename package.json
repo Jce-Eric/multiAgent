@@ -1,6 +1,6 @@
 {
   "name": "multi-agent-gateway",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "description": "A unified HTTP/SSE gateway for replaceable coding-agent engines.",
   "type": "module",
@@ -16,6 +16,7 @@
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
+    "@agentclientprotocol/sdk": "^1.4.0",
     "express": "^5.2.1"
   },
   "devDependencies": {

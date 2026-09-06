@@ -52,7 +52,11 @@ export function createApp(options: AppOptions = {}) {
   });
 
   app.get("/v1/engines", (_request, response) => {
-    response.json({ active: service.engine.name, available: availableEngines() });
+    response.json({
+      active: service.engine.name,
+      capabilities: service.engine.capabilities,
+      available: availableEngines(env),
+    });
   });
 
   app.get("/v1/events", (request, response) => {

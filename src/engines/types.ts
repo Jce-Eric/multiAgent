@@ -3,11 +3,32 @@ import type { Message, PermissionResponse, QuestionResponse } from "../types.js"
 export interface QuestionInput {
   question: string;
   choices?: string[];
+  schema?: unknown;
+  metadata?: unknown;
 }
 
 export interface PermissionInput {
   operation: string;
   reason?: string;
+  options?: Array<{
+    optionId: string;
+    name: string;
+    kind?: string;
+  }>;
+  metadata?: unknown;
+}
+
+export interface AgentCapabilities {
+  protocol: "reference" | "jsonl" | "acp";
+  nativeSessions: boolean;
+  questions: boolean;
+  permissions: boolean;
+  cancellation: boolean;
+}
+
+export interface AgentSessionContext {
+  sessionId: string;
+  directory: string;
 }
 
 export interface AgentRunContext {
@@ -19,9 +40,13 @@ export interface AgentRunContext {
   emitDelta: (text: string) => void;
   askQuestion: (input: QuestionInput) => Promise<QuestionResponse>;
   requestPermission: (input: PermissionInput) => Promise<PermissionResponse>;
+  emitEvent: (type: string, data: unknown) => void;
 }
 
 export interface AgentEngine {
   readonly name: string;
+  readonly capabilities: AgentCapabilities;
+  openSession?(context: AgentSessionContext): Promise<void>;
+  closeSession?(sessionId: string): Promise<void>;
   generate(prompt: string, context: AgentRunContext): Promise<string>;
 }

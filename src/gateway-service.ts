@@ -51,6 +51,7 @@ export class GatewayService {
       createdAt: timestamp,
       updatedAt: timestamp,
     };
+    await this.engine.openSession?.({ sessionId: session.id, directory: session.directory });
     this.sessions.add(session);
     this.events.publish("session.created", this.snapshot(session), { sessionId: session.id });
     return this.snapshot(session);
@@ -71,6 +72,7 @@ export class GatewayService {
       this.stopSession(id);
       await run.finished.promise;
     }
+    await this.engine.closeSession?.(id);
     this.sessions.delete(id);
     this.events.publish("session.deleted", { id: session.id }, { sessionId: session.id });
   }
@@ -121,22 +123,34 @@ export class GatewayService {
     }
 
     if (interaction.type === "question") {
-      if (!("answer" in response) || typeof response.answer !== "string" || !response.answer.trim()) {
+      const questionResponse = response as QuestionResponse;
+      const hasAnswer =
+        typeof questionResponse.answer === "string" && Boolean(questionResponse.answer.trim());
+      const hasAnswers =
+        questionResponse.answers !== undefined &&
+        typeof questionResponse.answers === "object" &&
+        questionResponse.answers !== null &&
+        Object.keys(questionResponse.answers).length > 0;
+      if (!(hasAnswer || hasAnswers)) {
         throw new GatewayError(
           400,
           "INTERACTION_RESPONSE_INVALID",
-          "Question responses require a non-empty 'answer'",
+          "Question responses require a non-empty 'answer' or 'answers' object",
         );
       }
-    } else if (
-      !("decision" in response) ||
-      (response.decision !== "allow" && response.decision !== "deny")
-    ) {
-      throw new GatewayError(
-        400,
-        "INTERACTION_RESPONSE_INVALID",
-        "Permission responses require decision 'allow' or 'deny'",
-      );
+    } else {
+      const permissionResponse = response as PermissionResponse;
+      if (
+        permissionResponse.optionId === undefined &&
+        permissionResponse.decision !== "allow" &&
+        permissionResponse.decision !== "deny"
+      ) {
+        throw new GatewayError(
+          400,
+          "INTERACTION_RESPONSE_INVALID",
+          "Permission responses require decision 'allow'/'deny' or an 'optionId'",
+        );
+      }
     }
 
     run.interactions.delete(requestId);
@@ -182,6 +196,13 @@ export class GatewayService {
         },
         askQuestion: (input) => this.createQuestion(session, run, input),
         requestPermission: (input) => this.createPermission(session, run, input),
+        emitEvent: (type, data) => {
+          if (run.controller.signal.aborted) return;
+          this.events.publish("agent.event", { type, data }, {
+            sessionId: session.id,
+            runId: run.id,
+          });
+        },
       });
 
       if (run.controller.signal.aborted) {
@@ -249,7 +270,13 @@ export class GatewayService {
     const interaction = this.registerInteraction(run, "question");
     this.events.publish(
       "interaction.question",
-      { requestId: interaction.id, question: input.question, choices: input.choices },
+      {
+        requestId: interaction.id,
+        question: input.question,
+        choices: input.choices,
+        schema: input.schema,
+        metadata: input.metadata,
+      },
       { sessionId: session.id, runId: run.id },
     );
     return interaction.value.promise as Promise<QuestionResponse>;
@@ -263,7 +290,13 @@ export class GatewayService {
     const interaction = this.registerInteraction(run, "permission");
     this.events.publish(
       "interaction.permission",
-      { requestId: interaction.id, operation: input.operation, reason: input.reason },
+      {
+        requestId: interaction.id,
+        operation: input.operation,
+        reason: input.reason,
+        options: input.options,
+        metadata: input.metadata,
+      },
       { sessionId: session.id, runId: run.id },
     );
     return interaction.value.promise as Promise<PermissionResponse>;
