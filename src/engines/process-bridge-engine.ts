@@ -17,6 +17,7 @@ interface BridgeEvent {
 export class ProcessBridgeEngine implements AgentEngine {
   readonly capabilities = {
     protocol: "jsonl",
+    protocolVersion: "1",
     nativeSessions: false,
     questions: true,
     permissions: true,
@@ -145,6 +146,7 @@ export class ProcessBridgeEngine implements AgentEngine {
 
     write({
       type: "run",
+      protocolVersion: "1",
       sessionId: context.sessionId,
       runId: context.runId,
       directory: context.directory,

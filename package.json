@@ -1,11 +1,11 @@
 {
   "name": "multi-agent-gateway",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "private": true,
   "description": "A unified HTTP/SSE gateway for replaceable coding-agent engines.",
   "type": "module",
   "engines": {
-    "node": ">=20.9"
+    "node": ">=22.5"
   },
   "scripts": {
     "dev": "tsx watch src/cli.ts",
@@ -13,6 +13,7 @@
     "build": "tsc -p tsconfig.json",
     "start:prod": "node dist/src/cli.js",
     "test": "tsx --test test/*.test.ts",
+    "test:integration": "tsx --test integration/*.test.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
@@ -21,12 +22,13 @@
   },
   "devDependencies": {
     "@types/express": "^5.0.3",
-    "@types/node": "^20.17.24",
+    "@types/node": "^24.0.0",
     "tsx": "^4.19.3",
     "typescript": "^5.8.2"
   },
   "optionalDependencies": {
     "@deepseek-ai/dsh": "0.1.2-rc.1",
-    "@openai/codex": "0.153.4"
+    "@openai/codex": "0.153.4",
+    "opencode-ai": "1.18.29"
   }
 }

@@ -49,7 +49,18 @@ async function main(): Promise<void> {
     console.log(`multi-agent-gateway listening on http://${options.host}:${port} (engine=${service.engine.name})`);
   });
 
-  const shutdown = () => server.close(() => process.exit(0));
+  let shutdownPromise: Promise<void> | undefined;
+  const shutdown = () => {
+    shutdownPromise ??= (async () => {
+      const serverClosed = new Promise<void>((resolve) => server.close(() => resolve()));
+      await service.shutdown();
+      server.closeAllConnections();
+      await serverClosed;
+    })().catch((error) => {
+      console.error(error);
+      process.exitCode = 1;
+    });
+  };
   process.once("SIGINT", shutdown);
   process.once("SIGTERM", shutdown);
 }

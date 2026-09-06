@@ -4,6 +4,7 @@ import { AbortGenerationError, GatewayError } from "../errors.js";
 import type { PermissionResponse, QuestionResponse } from "../types.js";
 import { deferred, type Deferred } from "../utils.js";
 import type { AgentEngine, AgentRunContext, AgentSessionContext } from "./types.js";
+import { prependTranscript } from "./transcript.js";
 
 type RpcId = string | number;
 type JsonObject = Record<string, unknown>;
@@ -32,6 +33,7 @@ interface CodexRuntime {
   stderr: string;
   threadId?: string;
   currentRun?: ActiveCodexRun;
+  seedMessages: AgentSessionContext["messages"];
   closing: boolean;
 }
 
@@ -64,6 +66,7 @@ const MAX_STDERR_LENGTH = 64 * 1024;
 export class CodexAppServerEngine implements AgentEngine {
   readonly capabilities = {
     protocol: "codex",
+    protocolVersion: "app-server-jsonrpc-v2",
     nativeSessions: true,
     questions: true,
     permissions: true,
@@ -95,6 +98,7 @@ export class CodexAppServerEngine implements AgentEngine {
       pending: new Map(),
       nextRequestId: 1,
       stderr: "",
+      seedMessages: context.messages,
       closing: false,
     };
 
@@ -120,7 +124,7 @@ export class CodexAppServerEngine implements AgentEngine {
     this.runtimes.set(context.sessionId, runtime);
 
     try {
-      await this.request(runtime, "initialize", {
+      const initialized = this.asObject(await this.request(runtime, "initialize", {
         clientInfo: {
           name: "multi-agent-gateway",
           title: "Multi-Agent Gateway",
@@ -130,7 +134,14 @@ export class CodexAppServerEngine implements AgentEngine {
           experimentalApi: true,
           requestAttestation: false,
         },
-      });
+      }));
+      if (typeof initialized.userAgent !== "string") {
+        throw new GatewayError(
+          502,
+          "ENGINE_PROTOCOL_ERROR",
+          "Codex initialize response did not include userAgent metadata",
+        );
+      }
       this.notify(runtime, "initialized");
       const started = await this.request(runtime, "thread/start", {
         cwd: context.directory,
@@ -149,7 +160,7 @@ export class CodexAppServerEngine implements AgentEngine {
       }
       runtime.threadId = threadId;
     } catch (error) {
-      this.destroyRuntime(runtime, error);
+      await this.destroyRuntime(runtime, error);
       if (error instanceof GatewayError) throw error;
       throw new GatewayError(
         502,
@@ -167,12 +178,16 @@ export class CodexAppServerEngine implements AgentEngine {
       await this.request(runtime, "thread/delete", { threadId: runtime.threadId }, 2_000)
         .catch(() => undefined);
     }
-    this.destroyRuntime(runtime);
+    await this.destroyRuntime(runtime);
   }
 
   async generate(prompt: string, context: AgentRunContext): Promise<string> {
     if (!this.runtimes.has(context.sessionId)) {
-      await this.openSession({ sessionId: context.sessionId, directory: context.directory });
+      await this.openSession({
+        sessionId: context.sessionId,
+        directory: context.directory,
+        messages: context.messages.slice(0, -1),
+      });
     }
     const runtime = this.runtimes.get(context.sessionId);
     if (!runtime?.threadId) {
@@ -205,16 +220,18 @@ export class CodexAppServerEngine implements AgentEngine {
     const onAbort = () => {
       interrupt();
       cancelTimer = setTimeout(() => {
-        this.destroyRuntime(runtime, new AbortGenerationError());
+        void this.destroyRuntime(runtime, new AbortGenerationError());
       }, 2_000);
       cancelTimer.unref();
     };
     context.signal.addEventListener("abort", onAbort, { once: true });
 
     try {
+      const effectivePrompt = prependTranscript(prompt, runtime.seedMessages);
+      runtime.seedMessages = [];
       const response = await this.request(runtime, "turn/start", {
         threadId: runtime.threadId,
-        input: [{ type: "text", text: prompt, text_elements: [] }],
+        input: [{ type: "text", text: effectivePrompt, text_elements: [] }],
         cwd: context.directory,
         runtimeWorkspaceRoots: [context.directory],
       }) as { turn?: CodexTurn };
@@ -538,10 +555,10 @@ export class CodexAppServerEngine implements AgentEngine {
     }
     runtime.pending.clear();
     runtime.currentRun?.completion.reject(normalized);
-    this.destroyRuntime(runtime, normalized);
+    void this.destroyRuntime(runtime, normalized);
   }
 
-  private destroyRuntime(runtime: CodexRuntime, reason?: unknown): void {
+  private async destroyRuntime(runtime: CodexRuntime, reason?: unknown): Promise<void> {
     if (runtime.closing) return;
     runtime.closing = true;
     this.runtimes.delete(runtime.gatewaySessionId);
@@ -558,6 +575,8 @@ export class CodexAppServerEngine implements AgentEngine {
       runtime.child.kill("SIGTERM");
       const timer = setTimeout(() => runtime.child.kill("SIGKILL"), 1_000);
       timer.unref();
+      await waitForExit(runtime.child, 2_000);
+      clearTimeout(timer);
     }
   }
 
@@ -624,4 +643,16 @@ export class CodexAppServerEngine implements AgentEngine {
   private errorMessage(error: unknown): string {
     return error instanceof Error ? error.message : String(error);
   }
+}
+
+function waitForExit(child: ChildProcessWithoutNullStreams, timeoutMs: number): Promise<void> {
+  if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve();
+  return new Promise((resolve) => {
+    const timer = setTimeout(resolve, timeoutMs);
+    timer.unref();
+    child.once("close", () => {
+      clearTimeout(timer);
+      resolve();
+    });
+  });
 }

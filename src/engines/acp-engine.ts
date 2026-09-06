@@ -4,6 +4,7 @@ import * as acp from "@agentclientprotocol/sdk";
 import { AbortGenerationError, GatewayError } from "../errors.js";
 import type { PermissionResponse, QuestionResponse } from "../types.js";
 import type { AgentEngine, AgentRunContext, AgentSessionContext } from "./types.js";
+import { prependTranscript } from "./transcript.js";
 
 interface ActiveAcpRun {
   context: AgentRunContext;
@@ -17,12 +18,14 @@ interface AcpRuntime {
   connection: acp.ClientConnection;
   session?: acp.ActiveSession;
   currentRun?: ActiveAcpRun;
+  seedMessages: AgentSessionContext["messages"];
   closing: boolean;
 }
 
 export class AcpEngine implements AgentEngine {
   readonly capabilities = {
     protocol: "acp",
+    protocolVersion: String(acp.PROTOCOL_VERSION),
     nativeSessions: true,
     questions: true,
     permissions: true,
@@ -73,6 +76,7 @@ export class AcpEngine implements AgentEngine {
       directory: context.directory,
       child,
       connection,
+      seedMessages: context.messages,
       closing: false,
     };
 
@@ -128,7 +132,11 @@ export class AcpEngine implements AgentEngine {
 
   async generate(prompt: string, context: AgentRunContext): Promise<string> {
     if (!this.runtimes.has(context.sessionId)) {
-      await this.openSession({ sessionId: context.sessionId, directory: context.directory });
+      await this.openSession({
+        sessionId: context.sessionId,
+        directory: context.directory,
+        messages: context.messages.slice(0, -1),
+      });
     }
     const runtime = this.runtimes.get(context.sessionId);
     if (!runtime?.session) {
@@ -152,7 +160,9 @@ export class AcpEngine implements AgentEngine {
     context.signal.addEventListener("abort", onAbort, { once: true });
 
     try {
-      const promptResult = runtime.session.prompt(prompt);
+      const effectivePrompt = prependTranscript(prompt, runtime.seedMessages);
+      runtime.seedMessages = [];
+      const promptResult = runtime.session.prompt(effectivePrompt);
       void promptResult.catch(() => undefined);
       for (;;) {
         const message = await runtime.session.nextUpdate();
@@ -284,6 +294,20 @@ export class AcpEngine implements AgentEngine {
       runtime.child.kill("SIGTERM");
       const timer = setTimeout(() => runtime.child.kill("SIGKILL"), 1_000);
       timer.unref();
+      await waitForExit(runtime.child, 2_000);
+      clearTimeout(timer);
     }
   }
+}
+
+function waitForExit(child: ChildProcessWithoutNullStreams, timeoutMs: number): Promise<void> {
+  if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve();
+  return new Promise((resolve) => {
+    const timer = setTimeout(resolve, timeoutMs);
+    timer.unref();
+    child.once("close", () => {
+      clearTimeout(timer);
+      resolve();
+    });
+  });
 }

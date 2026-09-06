@@ -43,11 +43,12 @@ const app = acp
     session.turn += 1;
     session.controller = new AbortController();
     const text = promptText(params.prompt);
+    const currentText = text.split("\nUSER: ").at(-1);
     let answer = "none";
     let permission = "none";
 
     try {
-      if (text.includes("ask")) {
+      if (currentText.includes("ask")) {
         const response = await client.request(acp.methods.client.elicitation.create, {
           mode: "form",
           sessionId: params.sessionId,
@@ -63,7 +64,7 @@ const app = acp
         if (response.action === "accept") answer = String(response.content?.branch ?? "missing");
       }
 
-      if (text.includes("permission")) {
+      if (currentText.includes("permission")) {
         await client.notify(acp.methods.client.session.update, {
           sessionId: params.sessionId,
           update: {
@@ -92,18 +93,21 @@ const app = acp
         permission = response.outcome.outcome === "selected" ? response.outcome.optionId : "cancelled";
       }
 
+      const restoredSuffix = currentText.includes("check restoration")
+        ? `;restored=${text.includes("<conversation_history>")}`
+        : "";
       await client.notify(acp.methods.client.session.update, {
         sessionId: params.sessionId,
         update: {
           sessionUpdate: "agent_message_chunk",
           content: {
             type: "text",
-            text: `turn=${session.turn};answer=${answer};permission=${permission};cwd=${session.cwd}`,
+            text: `turn=${session.turn};answer=${answer};permission=${permission};cwd=${session.cwd}${restoredSuffix}`,
           },
         },
       });
 
-      if (text.includes("slow")) await wait(10_000, session.controller.signal);
+      if (currentText.includes("slow")) await wait(10_000, session.controller.signal);
       session.controller = undefined;
       return { stopReason: "end_turn" };
     } catch (error) {

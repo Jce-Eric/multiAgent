@@ -37,7 +37,13 @@ const BUILTIN_ENGINES = {
   opencode: {
     prefix: "OPENCODE",
     label: "OpenCode",
-    protocol: "reference",
+    protocol: "acp",
+    command: packagedNativeCommand(
+      "opencode-ai",
+      "bin/opencode.exe",
+      ["acp"],
+      "opencode acp",
+    ),
   },
   "deepseek-harness": {
     prefix: "DEEPSEEK_HARNESS",
@@ -93,7 +99,7 @@ function loadDefinitions(env: NodeJS.ProcessEnv): Record<string, EngineDefinitio
     const configuredCommand = env[`${builtin.prefix}_COMMAND`]?.trim();
     const configuredProtocol = env[`${builtin.prefix}_PROTOCOL`];
     const protocol = normalizeProtocol(
-      configuredProtocol ?? (configuredCommand && builtin.protocol === "reference" ? "jsonl" : builtin.protocol),
+      configuredProtocol ?? builtin.protocol,
       name,
     );
     definitions[name] = {
@@ -161,6 +167,21 @@ function packagedCommand(
     const packagePath = require.resolve(`${packageName}/package.json`);
     const binPath = path.resolve(path.dirname(packagePath), relativeBinPath);
     return [process.execPath, binPath, ...args].map((value) => JSON.stringify(value)).join(" ");
+  } catch {
+    return fallback;
+  }
+}
+
+function packagedNativeCommand(
+  packageName: string,
+  relativeBinPath: string,
+  args: string[],
+  fallback: string,
+): string {
+  try {
+    const packagePath = require.resolve(`${packageName}/package.json`);
+    const binPath = path.resolve(path.dirname(packagePath), relativeBinPath);
+    return [binPath, ...args].map((value) => JSON.stringify(value)).join(" ");
   } catch {
     return fallback;
   }

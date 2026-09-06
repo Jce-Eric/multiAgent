@@ -10,6 +10,7 @@ const marker = (prompt: string, name: string): string | undefined => {
 export class ReferenceEngine implements AgentEngine {
   readonly capabilities = {
     protocol: "reference",
+    protocolVersion: "1",
     nativeSessions: false,
     questions: true,
     permissions: true,

@@ -20,6 +20,7 @@ export interface PermissionInput {
 
 export interface AgentCapabilities {
   protocol: "reference" | "jsonl" | "acp" | "codex";
+  protocolVersion: string;
   nativeSessions: boolean;
   questions: boolean;
   permissions: boolean;
@@ -29,6 +30,7 @@ export interface AgentCapabilities {
 export interface AgentSessionContext {
   sessionId: string;
   directory: string;
+  messages: readonly Message[];
 }
 
 export interface AgentRunContext {

@@ -136,7 +136,7 @@ test("session lifecycle, directory isolation, messages, status, stop, and errors
     });
     assert.equal(created.status, 201);
     const session = created.body.session as Session;
-    assert.equal(session.directory, project);
+    assert.equal(session.directory, await fs.realpath(project));
     assert.equal(session.status, "idle");
 
     const fetched = await requestJson(testServer.baseUrl, `/v1/sessions/${session.id}`);
@@ -321,7 +321,7 @@ test("an engine can be replaced by an external JSONL process bridge", async () =
   )}`;
   const { app, service } = createApp({
     engine: "opencode",
-    env: { ...process.env, OPENCODE_COMMAND: command },
+    env: { ...process.env, OPENCODE_COMMAND: command, OPENCODE_PROTOCOL: "jsonl" },
   });
   const server = createServer(app);
   server.listen(0, "127.0.0.1");
@@ -355,6 +355,7 @@ test("an engine can be replaced by an external JSONL process bridge", async () =
 
 test("DeepSeek Harness native ACP adapter maps sessions, interactions, updates, and cancellation", async () => {
   const project = await fs.mkdtemp(path.join(os.tmpdir(), "gateway-acp-project-"));
+  const realProject = await fs.realpath(project);
   const command = `${JSON.stringify(process.execPath)} ${JSON.stringify(
     path.resolve("test/fixtures/acp-agent.mjs"),
   )}`;
@@ -422,7 +423,7 @@ test("DeepSeek Harness native ACP adapter maps sessions, interactions, updates, 
     const firstTurn = await requestJson(baseUrl, `/v1/sessions/${sessionId}`);
     assert.equal(
       firstTurn.body.session.messages.at(-1).content,
-      `turn=1;answer=main;permission=allow;cwd=${project}`,
+      `turn=1;answer=main;permission=allow;cwd=${realProject}`,
     );
     assert(
       sse.events.some(
@@ -457,6 +458,52 @@ test("DeepSeek Harness native ACP adapter maps sessions, interactions, updates, 
     assert.equal(stopped.body.session.status, "idle");
 
     await requestJson(baseUrl, `/v1/sessions/${sessionId}`, { method: "DELETE" });
+  } finally {
+    if (sessionId) await service.engine.closeSession?.(sessionId);
+    await sse.close();
+    await closeServer(server);
+    await fs.rm(project, { recursive: true, force: true });
+  }
+});
+
+test("OpenCode native adapter uses the official ACP protocol", async () => {
+  const project = await fs.mkdtemp(path.join(os.tmpdir(), "gateway-opencode-project-"));
+  const realProject = await fs.realpath(project);
+  const command = `${JSON.stringify(process.execPath)} ${JSON.stringify(
+    path.resolve("test/fixtures/acp-agent.mjs"),
+  )}`;
+  const { app, service } = createApp({
+    engine: "opencode",
+    env: { ...process.env, OPENCODE_COMMAND: command, LOG_LEVEL: "silent" },
+  });
+  const server = createServer(app);
+  server.listen(0, "127.0.0.1");
+  await once(server, "listening");
+  const address = server.address();
+  assert(address && typeof address === "object");
+  const baseUrl = `http://127.0.0.1:${address.port}`;
+  const sse = new SseClient();
+  let sessionId: string | undefined;
+  try {
+    await sse.connect(`${baseUrl}/v1/events`);
+    const engines = await requestJson(baseUrl, "/v1/engines");
+    assert.equal(engines.body.capabilities.protocol, "acp");
+    assert.equal(typeof engines.body.capabilities.protocolVersion, "string");
+    const created = await requestJson(baseUrl, "/v1/sessions", {
+      method: "POST",
+      body: JSON.stringify({ directory: project }),
+    });
+    sessionId = created.body.session.id;
+    const sent = await requestJson(baseUrl, `/v1/sessions/${sessionId}/messages`, {
+      method: "POST",
+      body: JSON.stringify({ content: "hello from opencode" }),
+    });
+    await sse.waitFor("generation.completed", (event) => event.runId === sent.body.runId);
+    const session = await requestJson(baseUrl, `/v1/sessions/${sessionId}`);
+    assert.equal(
+      session.body.session.messages.at(-1).content,
+      `turn=1;answer=none;permission=none;cwd=${realProject}`,
+    );
   } finally {
     if (sessionId) await service.engine.closeSession?.(sessionId);
     await sse.close();
@@ -592,7 +639,11 @@ test("CLI --engine selects the engine at startup", async () => {
   const child = spawn(
     path.resolve("node_modules/.bin/tsx"),
     ["src/cli.ts", "--engine", "opencode", "--port", "0"],
-    { cwd: process.cwd(), stdio: ["ignore", "pipe", "pipe"] },
+    {
+      cwd: process.cwd(),
+      env: { ...process.env, OPENCODE_PROTOCOL: "reference", LOG_LEVEL: "silent" },
+      stdio: ["ignore", "pipe", "pipe"],
+    },
   );
   try {
     const output = await new Promise<string>((resolve, reject) => {

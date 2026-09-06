@@ -2,6 +2,8 @@
 
 每次生成会启动一个配置的子进程，并将会话的 `directory` 用作子进程工作目录。stdin/stdout 使用一行一个 JSON 对象的 JSONL 协议；stderr 只用于诊断。
 
+JSONL bridge 协议版本为 `1`。它是本项目的兼容协议，不是业界标准；支持 ACP 时应优先使用 ACP Adapter。
+
 网关首先写入：
 
 ```json

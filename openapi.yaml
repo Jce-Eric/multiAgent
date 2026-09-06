@@ -1,0 +1,282 @@
+openapi: 3.1.0
+info:
+  title: Multi-Agent Gateway API
+  version: 0.4.0
+  description: Unified sessions, messages, interactions, cancellation, and SSE events for replaceable coding agents.
+servers:
+  - url: http://127.0.0.1:3000
+security:
+  - bearerAuth: []
+  - apiKeyAuth: []
+paths:
+  /health:
+    get:
+      security: []
+      summary: Liveness probe
+      responses:
+        "200":
+          description: Gateway process is alive
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status, engine, version]
+                properties:
+                  status: { type: string, const: ok }
+                  engine: { type: string }
+                  version: { type: string }
+  /ready:
+    get:
+      security: []
+      summary: Readiness probe
+      responses:
+        "200": { description: Gateway and repository are ready }
+        "503": { description: Gateway is shutting down or repository is unavailable }
+  /metrics:
+    get:
+      summary: Prometheus metrics
+      responses:
+        "200":
+          description: Prometheus text exposition
+          content:
+            text/plain:
+              schema: { type: string }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+  /v1/engines:
+    get:
+      summary: Get active and available engines
+      responses:
+        "200":
+          description: Engine metadata
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [gatewayVersion, active, capabilities, available]
+                properties:
+                  gatewayVersion: { type: string }
+                  active: { type: string }
+                  available: { type: array, items: { type: string } }
+                  capabilities: { $ref: "#/components/schemas/AgentCapabilities" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+  /v1/events:
+    get:
+      summary: Subscribe to the global or session-filtered SSE stream
+      parameters:
+        - in: query
+          name: sessionId
+          schema: { type: string }
+        - in: query
+          name: lastEventId
+          description: Replay retained events after this sequence number. The Last-Event-ID header is also supported.
+          schema: { type: integer, minimum: 0 }
+      responses:
+        "200":
+          description: Server-Sent Events stream. Each data field contains a GatewayEvent JSON object.
+          content:
+            text/event-stream:
+              schema: { type: string }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+  /v1/sessions:
+    get:
+      summary: List sessions for the active engine
+      responses:
+        "200":
+          description: Session list
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [sessions]
+                properties:
+                  sessions: { type: array, items: { $ref: "#/components/schemas/Session" } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+    post:
+      summary: Create a session
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                directory:
+                  type: string
+                  description: Existing project directory, restricted by AGENT_ALLOWED_ROOTS when configured.
+      responses:
+        "201":
+          description: Session created
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [session]
+                properties:
+                  session: { $ref: "#/components/schemas/Session" }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Error" }
+        "429": { $ref: "#/components/responses/Error" }
+  /v1/sessions/{sessionId}:
+    parameters:
+      - $ref: "#/components/parameters/SessionId"
+    get:
+      summary: Get a session and its messages
+      responses:
+        "200":
+          description: Session snapshot
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [session]
+                properties:
+                  session: { $ref: "#/components/schemas/Session" }
+        "404": { $ref: "#/components/responses/Error" }
+    delete:
+      summary: Delete a session and stop an active run
+      responses:
+        "204": { description: Session deleted }
+        "404": { $ref: "#/components/responses/Error" }
+  /v1/sessions/{sessionId}/messages:
+    parameters:
+      - $ref: "#/components/parameters/SessionId"
+    post:
+      summary: Start an Agent generation
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [content]
+              properties:
+                content: { type: string, minLength: 1 }
+      responses:
+        "202":
+          description: Generation accepted; subscribe to SSE for updates
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/RunAccepted" }
+        "404": { $ref: "#/components/responses/Error" }
+        "409": { $ref: "#/components/responses/Error" }
+        "429": { $ref: "#/components/responses/Error" }
+  /v1/sessions/{sessionId}/interactions/{requestId}/respond:
+    parameters:
+      - $ref: "#/components/parameters/SessionId"
+      - in: path
+        name: requestId
+        required: true
+        schema: { type: string }
+    post:
+      summary: Answer an Agent question or permission request
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - $ref: "#/components/schemas/QuestionResponse"
+                - $ref: "#/components/schemas/PermissionResponse"
+      responses:
+        "202": { description: Interaction response accepted }
+        "400": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+  /v1/sessions/{sessionId}/stop:
+    parameters:
+      - $ref: "#/components/parameters/SessionId"
+    post:
+      summary: Stop the active generation
+      responses:
+        "202":
+          description: Stop accepted
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/RunAccepted" }
+        "404": { $ref: "#/components/responses/Error" }
+        "409": { $ref: "#/components/responses/Error" }
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+    apiKeyAuth:
+      type: apiKey
+      in: header
+      name: X-API-Key
+  parameters:
+    SessionId:
+      in: path
+      name: sessionId
+      required: true
+      schema: { type: string }
+  responses:
+    Error:
+      description: Gateway error
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+    Unauthorized:
+      description: API key missing or invalid
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+  schemas:
+    AgentCapabilities:
+      type: object
+      required: [protocol, protocolVersion, nativeSessions, questions, permissions, cancellation]
+      properties:
+        protocol: { type: string, enum: [reference, jsonl, acp, codex] }
+        protocolVersion: { type: string }
+        nativeSessions: { type: boolean }
+        questions: { type: boolean }
+        permissions: { type: boolean }
+        cancellation: { type: boolean }
+    Message:
+      type: object
+      required: [id, role, content, status, createdAt]
+      properties:
+        id: { type: string }
+        role: { type: string, enum: [user, assistant] }
+        content: { type: string }
+        status: { type: string, enum: [completed, stopped] }
+        createdAt: { type: string, format: date-time }
+    Session:
+      type: object
+      required: [id, engine, directory, status, messages, createdAt, updatedAt]
+      properties:
+        id: { type: string }
+        engine: { type: string }
+        directory: { type: string }
+        status: { type: string, enum: [idle, busy] }
+        messages: { type: array, items: { $ref: "#/components/schemas/Message" } }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+    RunAccepted:
+      type: object
+      required: [runId]
+      properties:
+        runId: { type: string }
+    QuestionResponse:
+      type: object
+      properties:
+        answer: { type: string }
+        answers: { type: object, additionalProperties: true }
+    PermissionResponse:
+      type: object
+      properties:
+        decision: { type: string, enum: [allow, deny] }
+        optionId: { type: string }
+    ErrorEnvelope:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message, requestId]
+          properties:
+            code: { type: string }
+            message: { type: string }
+            details: {}
+            requestId: { type: string }

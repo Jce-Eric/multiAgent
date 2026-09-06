@@ -1,0 +1,20 @@
+services:
+  gateway:
+    build: .
+    command: ["node", "dist/src/cli.js", "--engine", "${AGENT_ENGINE:-codeagent}"]
+    environment:
+      HOST: 0.0.0.0
+      PORT: 3000
+      GATEWAY_DATABASE_PATH: /data/gateway.db
+      AGENT_ALLOWED_ROOTS: /workspace
+      GATEWAY_API_KEY: ${GATEWAY_API_KEY:-}
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+    ports:
+      - "3000:3000"
+    volumes:
+      - gateway-data:/data
+      - ./:/workspace
+    restart: unless-stopped
+
+volumes:
+  gateway-data:

@@ -1,14 +1,27 @@
-import { randomUUID } from "node:crypto";
-import express, { type ErrorRequestHandler, type NextFunction, type Request, type Response } from "express";
-import { createEngine, availableEngines } from "./engines/registry.js";
+import { randomUUID, timingSafeEqual } from "node:crypto";
+import path from "node:path";
+import express, {
+  type ErrorRequestHandler,
+  type NextFunction,
+  type Request,
+  type Response,
+} from "express";
+import { loadGatewayConfig, type GatewayConfig } from "./config.js";
+import { availableEngines, createEngine } from "./engines/registry.js";
 import { GatewayError } from "./errors.js";
+import { EventBus } from "./event-bus.js";
 import { GatewayService } from "./gateway-service.js";
+import { GatewayMetrics } from "./metrics.js";
+import { createSessionRepository, type SessionRepository } from "./session-store.js";
 import type { GatewayEvent, PermissionResponse, QuestionResponse } from "./types.js";
+import { GATEWAY_VERSION } from "./version.js";
 
 export interface AppOptions {
   engine?: string;
   env?: NodeJS.ProcessEnv;
   defaultDirectory?: string;
+  config?: Partial<GatewayConfig>;
+  repository?: SessionRepository;
 }
 
 const asyncRoute =
@@ -36,23 +49,95 @@ function writeSse(response: Response, event: GatewayEvent): void {
 
 export function createApp(options: AppOptions = {}) {
   const env = options.env ?? process.env;
+  const config = { ...loadGatewayConfig(env), ...options.config };
   const engineName = options.engine ?? env.AGENT_ENGINE ?? "codeagent";
+  const events = new EventBus(config.eventHistoryLimit);
+  const repository = options.repository ?? createSessionRepository(config.databasePath);
   const service = new GatewayService(
     createEngine(engineName, env),
-    undefined,
+    events,
     options.defaultDirectory,
+    {
+      allowedRoots: config.allowedRoots,
+      generationTimeoutMs: config.generationTimeoutMs,
+      idleSessionTimeoutMs: config.idleSessionTimeoutMs,
+      maxConcurrentRuns: config.maxConcurrentRuns,
+      maxMessagesPerSession: config.maxMessagesPerSession,
+      maxSessions: config.maxSessions,
+      permissionPolicy: config.permissionPolicy,
+      repository,
+    },
   );
+  const metrics = new GatewayMetrics(service);
   const app = express();
 
   app.disable("x-powered-by");
+  app.use((request, response, next) => {
+    const requestId = request.get("x-request-id")?.trim() || randomUUID();
+    const startedAt = Date.now();
+    response.locals.requestId = requestId;
+    response.setHeader("x-request-id", requestId);
+    response.once("finish", () => {
+      const route = request.route?.path
+        ? `${request.baseUrl}${String(request.route.path)}`
+        : request.path;
+      metrics.observeRequest(request.method, route, response.statusCode);
+      if (config.logLevel === "info") {
+        console.log(JSON.stringify({
+          timestamp: new Date().toISOString(),
+          level: "info",
+          message: "http_request",
+          requestId,
+          method: request.method,
+          path: request.originalUrl,
+          route,
+          status: response.statusCode,
+          durationMs: Date.now() - startedAt,
+          sessionId: sessionIdFromPath(request.path),
+          runId: response.locals.runId,
+        }));
+      }
+    });
+    next();
+  });
+  app.get("/health", (_request, response) => {
+    response.json({ status: "ok", engine: service.engine.name, version: GATEWAY_VERSION });
+  });
+
+  app.get("/ready", (_request, response) => {
+    const ready = service.isReady();
+    response.status(ready ? 200 : 503).json({ status: ready ? "ready" : "not_ready" });
+  });
+
+  app.get("/openapi.yaml", (_request, response) => {
+    response.sendFile(path.resolve(process.cwd(), "openapi.yaml"));
+  });
+
+  app.use((request, _response, next) => {
+    if (!config.apiKey || !(request.path.startsWith("/v1") || request.path === "/metrics")) {
+      next();
+      return;
+    }
+    const authorization = request.get("authorization");
+    const provided = authorization?.startsWith("Bearer ")
+      ? authorization.slice("Bearer ".length)
+      : request.get("x-api-key");
+    if (!provided || !secureEqual(provided, config.apiKey)) {
+      next(new GatewayError(401, "UNAUTHORIZED", "A valid gateway API key is required"));
+      return;
+    }
+    next();
+  });
+
   app.use(express.json({ limit: "1mb" }));
 
-  app.get("/health", (_request, response) => {
-    response.json({ status: "ok", engine: service.engine.name });
+  app.get("/metrics", (_request, response) => {
+    response.type("text/plain; version=0.0.4").send(metrics.render());
   });
 
   app.get("/v1/engines", (_request, response) => {
     response.json({
+      gatewayVersion: GATEWAY_VERSION,
       active: service.engine.name,
       capabilities: service.engine.capabilities,
       available: availableEngines(env),
@@ -66,7 +151,6 @@ export function createApp(options: AppOptions = {}) {
     if (!Number.isFinite(lastEventId) || lastEventId < 0) {
       throw new GatewayError(400, "VALIDATION_ERROR", "Last-Event-ID must be a positive number");
     }
-
     response.status(200);
     response.set({
       "Content-Type": "text/event-stream",
@@ -76,15 +160,9 @@ export function createApp(options: AppOptions = {}) {
     });
     response.flushHeaders();
     response.write(": connected\n\n");
-
-    for (const event of service.events.eventsAfter(lastEventId, sessionId)) {
-      writeSse(response, event);
-    }
-
+    for (const event of service.events.eventsAfter(lastEventId, sessionId)) writeSse(response, event);
     const unsubscribe = service.events.subscribe((event) => {
-      if (!sessionId || event.sessionId === sessionId) {
-        writeSse(response, event);
-      }
+      if (!sessionId || event.sessionId === sessionId) writeSse(response, event);
     });
     const heartbeat = setInterval(() => response.write(": heartbeat\n\n"), 15_000);
     heartbeat.unref();
@@ -125,6 +203,7 @@ export function createApp(options: AppOptions = {}) {
   app.post("/v1/sessions/:sessionId/messages", (request, response) => {
     const content = requiredString(request.body?.content, "content");
     const result = service.sendMessage(routeParam(request.params.sessionId, "sessionId"), content);
+    response.locals.runId = result.runId;
     response.status(202).json(result);
   });
 
@@ -142,9 +221,9 @@ export function createApp(options: AppOptions = {}) {
   });
 
   app.post("/v1/sessions/:sessionId/stop", (request, response) => {
-    response.status(202).json(
-      service.stopSession(routeParam(request.params.sessionId, "sessionId")),
-    );
+    const result = service.stopSession(routeParam(request.params.sessionId, "sessionId"));
+    response.locals.runId = result.runId;
+    response.status(202).json(result);
   });
 
   app.use((_request, _response, next) => {
@@ -152,7 +231,7 @@ export function createApp(options: AppOptions = {}) {
   });
 
   const errorHandler: ErrorRequestHandler = (error, _request, response, _next) => {
-    const requestId = randomUUID();
+    const requestId = String(response.locals.requestId ?? randomUUID());
     if (error instanceof GatewayError) {
       response.status(error.status).json({
         error: {
@@ -164,20 +243,34 @@ export function createApp(options: AppOptions = {}) {
       });
       return;
     }
-
     if (error instanceof SyntaxError && "body" in error) {
       response.status(400).json({
         error: { code: "VALIDATION_ERROR", message: "Request body is not valid JSON", requestId },
       });
       return;
     }
-
-    console.error(error);
+    console.error(JSON.stringify({
+      timestamp: new Date().toISOString(),
+      level: "error",
+      message: "unhandled_request_error",
+      requestId,
+      error: error instanceof Error ? error.message : String(error),
+    }));
     response.status(500).json({
       error: { code: "INTERNAL_ERROR", message: "An unexpected error occurred", requestId },
     });
   };
   app.use(errorHandler);
 
-  return { app, service };
+  return { app, service, config, metrics };
+}
+
+function secureEqual(left: string, right: string): boolean {
+  const leftBuffer = Buffer.from(left);
+  const rightBuffer = Buffer.from(right);
+  return leftBuffer.length === rightBuffer.length && timingSafeEqual(leftBuffer, rightBuffer);
+}
+
+function sessionIdFromPath(pathname: string): string | undefined {
+  return pathname.match(/^\/v1\/sessions\/([^/]+)/)?.[1];
 }
