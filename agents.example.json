@@ -1,5 +1,10 @@
 {
   "engines": {
+    "another-codex": {
+      "protocol": "codex",
+      "command": "codex app-server --stdio",
+      "displayName": "Another Codex Profile"
+    },
     "my-acp-agent": {
       "protocol": "acp",
       "command": "my-agent --acp",

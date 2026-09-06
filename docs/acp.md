@@ -2,6 +2,14 @@
 
 网关使用 `@agentclientprotocol/sdk` 的稳定 ACP v1 接口作为客户端，通过 NDJSON stdin/stdout 与 Agent 通信。
 
+内置 `deepseek-harness` 引擎直接启动 DeepSeek Harness 官方 ACP profile：
+
+```bash
+DEEPSEEK_API_KEY="..." npm start -- --engine deepseek-harness
+```
+
+默认命令为 `dsh --profile acp`。如果 `@deepseek-ai/dsh` 可选依赖已安装，注册表会直接解析包内 CLI 入口，不依赖全局 `PATH`；也可以通过 `DEEPSEEK_HARNESS_COMMAND` 覆盖。
+
 ## 生命周期
 
 每个网关 Session 对应一个独立的 ACP 子进程和原生 ACP Session：

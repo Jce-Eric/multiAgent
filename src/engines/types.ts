@@ -19,7 +19,7 @@ export interface PermissionInput {
 }
 
 export interface AgentCapabilities {
-  protocol: "reference" | "jsonl" | "acp";
+  protocol: "reference" | "jsonl" | "acp" | "codex";
   nativeSessions: boolean;
   questions: boolean;
   permissions: boolean;

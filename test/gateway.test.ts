@@ -15,7 +15,14 @@ interface TestServer {
 }
 
 async function startServer(engine = "codeagent"): Promise<TestServer> {
-  const { app } = createApp({ engine });
+  const { app } = createApp({
+    engine,
+    env: {
+      ...process.env,
+      CODEAGENT_PROTOCOL: "reference",
+      OPENCODE_PROTOCOL: "reference",
+    },
+  });
   const server = createServer(app);
   server.listen(0, "127.0.0.1");
   await once(server, "listening");
@@ -346,29 +353,16 @@ test("an engine can be replaced by an external JSONL process bridge", async () =
   }
 });
 
-test("ACP adapter maps sessions, elicitation, permission, updates, and cancellation", async () => {
+test("DeepSeek Harness native ACP adapter maps sessions, interactions, updates, and cancellation", async () => {
   const project = await fs.mkdtemp(path.join(os.tmpdir(), "gateway-acp-project-"));
   const command = `${JSON.stringify(process.execPath)} ${JSON.stringify(
     path.resolve("test/fixtures/acp-agent.mjs"),
   )}`;
-  const configPath = path.join(project, "agents.json");
-  await fs.writeFile(
-    configPath,
-    JSON.stringify({
-      engines: {
-        "fixture-acp": {
-          protocol: "acp",
-          command,
-          displayName: "Fixture ACP Agent",
-        },
-      },
-    }),
-  );
   const { app, service } = createApp({
-    engine: "fixture-acp",
+    engine: "deepseek-harness",
     env: {
       ...process.env,
-      AGENT_ENGINE_CONFIG: configPath,
+      DEEPSEEK_HARNESS_COMMAND: command,
     },
   });
   const server = createServer(app);
@@ -383,8 +377,8 @@ test("ACP adapter maps sessions, elicitation, permission, updates, and cancellat
   try {
     await sse.connect(`${baseUrl}/v1/events`);
     const engines = await requestJson(baseUrl, "/v1/engines");
-    assert.equal(engines.body.active, "fixture-acp");
-    assert(engines.body.available.includes("fixture-acp"));
+    assert.equal(engines.body.active, "deepseek-harness");
+    assert(engines.body.available.includes("deepseek-harness"));
     assert.equal(engines.body.capabilities.protocol, "acp");
     assert.equal(engines.body.capabilities.nativeSessions, true);
 
@@ -463,6 +457,129 @@ test("ACP adapter maps sessions, elicitation, permission, updates, and cancellat
     assert.equal(stopped.body.session.status, "idle");
 
     await requestJson(baseUrl, `/v1/sessions/${sessionId}`, { method: "DELETE" });
+  } finally {
+    if (sessionId) await service.engine.closeSession?.(sessionId);
+    await sse.close();
+    await closeServer(server);
+    await fs.rm(project, { recursive: true, force: true });
+  }
+});
+
+test("CodeAgent native Codex adapter maps threads, turns, questions, approvals, events, and stop", async () => {
+  const project = await fs.mkdtemp(path.join(os.tmpdir(), "gateway-codex-project-"));
+  const realProject = await fs.realpath(project);
+  const command = `${JSON.stringify(process.execPath)} ${JSON.stringify(
+    path.resolve("test/fixtures/codex-app-server.mjs"),
+  )}`;
+  const { app, service } = createApp({
+    engine: "codeagent",
+    env: { ...process.env, CODEAGENT_COMMAND: command },
+  });
+  const server = createServer(app);
+  server.listen(0, "127.0.0.1");
+  await once(server, "listening");
+  const address = server.address();
+  assert(address && typeof address === "object");
+  const baseUrl = `http://127.0.0.1:${address.port}`;
+  const sse = new SseClient();
+  let sessionId: string | undefined;
+
+  try {
+    await sse.connect(`${baseUrl}/v1/events`);
+    const engines = await requestJson(baseUrl, "/v1/engines");
+    assert.equal(engines.body.capabilities.protocol, "codex");
+    assert.equal(engines.body.capabilities.nativeSessions, true);
+
+    const created = await requestJson(baseUrl, "/v1/sessions", {
+      method: "POST",
+      body: JSON.stringify({ directory: project }),
+    });
+    assert.equal(created.status, 201);
+    sessionId = created.body.session.id;
+
+    const sent = await requestJson(baseUrl, `/v1/sessions/${sessionId}/messages`, {
+      method: "POST",
+      body: JSON.stringify({ content: "run checks" }),
+    });
+    const question = await sse.waitFor(
+      "interaction.question",
+      (event) => event.runId === sent.body.runId,
+    );
+    assert.deepEqual((question.data as any).choices, ["main", "dev"]);
+    await requestJson(
+      baseUrl,
+      `/v1/sessions/${sessionId}/interactions/${(question.data as any).requestId}/respond`,
+      { method: "POST", body: JSON.stringify({ answers: { branch: "main" } }) },
+    );
+
+    const permission = await sse.waitFor(
+      "interaction.permission",
+      (event) => event.runId === sent.body.runId,
+    );
+    assert.equal((permission.data as any).operation, "npm test");
+    assert.deepEqual(
+      (permission.data as any).options.map((option: any) => option.optionId),
+      ["accept", "acceptForSession", "decline", "cancel"],
+    );
+    await requestJson(
+      baseUrl,
+      `/v1/sessions/${sessionId}/interactions/${(permission.data as any).requestId}/respond`,
+      { method: "POST", body: JSON.stringify({ optionId: "acceptForSession" }) },
+    );
+    await sse.waitFor("generation.completed", (event) => event.runId === sent.body.runId);
+
+    const first = await requestJson(baseUrl, `/v1/sessions/${sessionId}`);
+    assert.equal(
+      first.body.session.messages.at(-1).content,
+      `turn=1;answer=main;permission=acceptForSession;cwd=${realProject}`,
+    );
+    assert(
+      sse.events.some(
+        (event) => event.type === "agent.event" && (event.data as any).type === "codex.item/started",
+      ),
+    );
+
+    const second = await requestJson(baseUrl, `/v1/sessions/${sessionId}/messages`, {
+      method: "POST",
+      body: JSON.stringify({ content: "second turn" }),
+    });
+    const secondQuestion = await sse.waitFor(
+      "interaction.question",
+      (event) => event.runId === second.body.runId,
+    );
+    await requestJson(
+      baseUrl,
+      `/v1/sessions/${sessionId}/interactions/${(secondQuestion.data as any).requestId}/respond`,
+      { method: "POST", body: JSON.stringify({ answer: "dev" }) },
+    );
+    const secondPermission = await sse.waitFor(
+      "interaction.permission",
+      (event) => event.runId === second.body.runId,
+    );
+    await requestJson(
+      baseUrl,
+      `/v1/sessions/${sessionId}/interactions/${(secondPermission.data as any).requestId}/respond`,
+      { method: "POST", body: JSON.stringify({ decision: "allow" }) },
+    );
+    await sse.waitFor("generation.completed", (event) => event.runId === second.body.runId);
+    const secondTurn = await requestJson(baseUrl, `/v1/sessions/${sessionId}`);
+    assert.match(secondTurn.body.session.messages.at(-1).content, /^turn=2;/);
+
+    const slow = await requestJson(baseUrl, `/v1/sessions/${sessionId}/messages`, {
+      method: "POST",
+      body: JSON.stringify({ content: "slow" }),
+    });
+    await sse.waitFor("message.assistant.delta", (event) => event.runId === slow.body.runId);
+    await requestJson(baseUrl, `/v1/sessions/${sessionId}/stop`, {
+      method: "POST",
+      body: "{}",
+    });
+    await sse.waitFor("generation.stopped", (event) => event.runId === slow.body.runId);
+    const stopped = await requestJson(baseUrl, `/v1/sessions/${sessionId}`);
+    assert.equal(stopped.body.session.status, "idle");
+
+    await requestJson(baseUrl, `/v1/sessions/${sessionId}`, { method: "DELETE" });
+    sessionId = undefined;
   } finally {
     if (sessionId) await service.engine.closeSession?.(sessionId);
     await sse.close();

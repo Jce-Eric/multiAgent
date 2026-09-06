@@ -1,12 +1,14 @@
 import { readFileSync } from "node:fs";
+import { createRequire } from "node:module";
 import path from "node:path";
 import { GatewayError } from "../errors.js";
 import { AcpEngine } from "./acp-engine.js";
+import { CodexAppServerEngine } from "./codex-app-server-engine.js";
 import type { AgentEngine } from "./types.js";
 import { ProcessBridgeEngine } from "./process-bridge-engine.js";
 import { ReferenceEngine } from "./reference-engine.js";
 
-export type EngineProtocol = "reference" | "jsonl" | "acp";
+export type EngineProtocol = "reference" | "jsonl" | "acp" | "codex";
 
 export interface EngineDefinition {
   protocol: EngineProtocol;
@@ -18,10 +20,36 @@ interface EngineConfigFile {
   engines?: Record<string, EngineDefinition>;
 }
 
+const require = createRequire(import.meta.url);
+
 const BUILTIN_ENGINES = {
-  codeagent: { prefix: "CODEAGENT", label: "CodeAgent" },
-  opencode: { prefix: "OPENCODE", label: "OpenCode" },
-  "deepseek-harness": { prefix: "DEEPSEEK_HARNESS", label: "DeepSeek Harness" },
+  codeagent: {
+    prefix: "CODEAGENT",
+    label: "CodeAgent",
+    protocol: "codex",
+    command: packagedCommand(
+      "@openai/codex",
+      "bin/codex.js",
+      ["app-server", "--stdio"],
+      "codex app-server --stdio",
+    ),
+  },
+  opencode: {
+    prefix: "OPENCODE",
+    label: "OpenCode",
+    protocol: "reference",
+  },
+  "deepseek-harness": {
+    prefix: "DEEPSEEK_HARNESS",
+    label: "DeepSeek Harness",
+    protocol: "acp",
+    command: packagedCommand(
+      "@deepseek-ai/dsh",
+      "lib/bin.js",
+      ["--profile", "acp"],
+      "dsh --profile acp",
+    ),
+  },
 } as const;
 
 export type EngineName = string;
@@ -50,20 +78,29 @@ export function createEngine(name: string, env: NodeJS.ProcessEnv = process.env)
       `Engine '${normalized}' requires a command for protocol '${definition.protocol}'`,
     );
   }
-  return definition.protocol === "acp"
-    ? new AcpEngine(normalized, definition.command, env)
-    : new ProcessBridgeEngine(normalized, definition.command, env);
+  if (definition.protocol === "acp") {
+    return new AcpEngine(normalized, definition.command, env);
+  }
+  if (definition.protocol === "codex") {
+    return new CodexAppServerEngine(normalized, definition.command, env);
+  }
+  return new ProcessBridgeEngine(normalized, definition.command, env);
 }
 
 function loadDefinitions(env: NodeJS.ProcessEnv): Record<string, EngineDefinition> {
   const definitions: Record<string, EngineDefinition> = {};
   for (const [name, builtin] of Object.entries(BUILTIN_ENGINES)) {
-    const command = env[`${builtin.prefix}_COMMAND`]?.trim();
+    const configuredCommand = env[`${builtin.prefix}_COMMAND`]?.trim();
+    const configuredProtocol = env[`${builtin.prefix}_PROTOCOL`];
     const protocol = normalizeProtocol(
-      env[`${builtin.prefix}_PROTOCOL`] ?? (command ? "jsonl" : "reference"),
+      configuredProtocol ?? (configuredCommand && builtin.protocol === "reference" ? "jsonl" : builtin.protocol),
       name,
     );
-    definitions[name] = { protocol, command, displayName: builtin.label };
+    definitions[name] = {
+      protocol,
+      command: configuredCommand ?? ("command" in builtin ? builtin.command : undefined),
+      displayName: builtin.label,
+    };
   }
 
   const configPath = env.AGENT_ENGINE_CONFIG?.trim();
@@ -104,10 +141,27 @@ function loadDefinitions(env: NodeJS.ProcessEnv): Record<string, EngineDefinitio
 }
 
 function normalizeProtocol(value: unknown, engineName: string): EngineProtocol {
-  if (value === "reference" || value === "jsonl" || value === "acp") return value;
+  if (value === "reference" || value === "jsonl" || value === "acp" || value === "codex") {
+    return value;
+  }
   throw new GatewayError(
     400,
     "ENGINE_CONFIG_INVALID",
     `Engine '${engineName}' has unsupported protocol '${String(value)}'`,
   );
+}
+
+function packagedCommand(
+  packageName: string,
+  relativeBinPath: string,
+  args: string[],
+  fallback: string,
+): string {
+  try {
+    const packagePath = require.resolve(`${packageName}/package.json`);
+    const binPath = path.resolve(path.dirname(packagePath), relativeBinPath);
+    return [process.execPath, binPath, ...args].map((value) => JSON.stringify(value)).join(" ");
+  } catch {
+    return fallback;
+  }
 }

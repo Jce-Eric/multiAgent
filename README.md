@@ -4,6 +4,8 @@
 
 ## 启动
 
+要求 Node.js 20.9 或更高版本。`npm install` 会安装 Codex CLI 和 DeepSeek Harness 作为可选运行时依赖。
+
 ```bash
 npm install
 npm start -- --engine codeagent --port 3000
@@ -11,15 +13,36 @@ npm start -- --engine codeagent --port 3000
 
 内置引擎名称：`codeagent`、`opencode`、`deepseek-harness`。启动参数优先级为 `--engine` > `AGENT_ENGINE` > `codeagent`。
 
-未设置桥接命令时，服务使用可直接运行的内置参考引擎。设置下面任一环境变量后，对应引擎会切换为外部 JSONL 子进程适配器：
+| 引擎 | 默认实现 | 前置条件 |
+| --- | --- | --- |
+| `codeagent` | OpenAI Codex `app-server` JSON-RPC | 完成 Codex 登录或配置 API Key |
+| `deepseek-harness` | DeepSeek Harness 官方 `dsh --profile acp` | 设置 `DEEPSEEK_API_KEY` |
+| `opencode` | 内置参考实现，可配置为 JSONL/ACP 外部进程 | 取决于配置的 Agent |
+
+两个原生引擎不会在启动失败时静默切换到参考实现。创建会话时如果二进制、认证或配置不可用，API 会返回 `ENGINE_SESSION_ERROR` 及诊断信息。
+
+启动 DeepSeek Harness：
 
 ```bash
-CODEAGENT_COMMAND="my-codeagent-bridge"
-OPENCODE_COMMAND="my-opencode-bridge"
-DEEPSEEK_HARNESS_COMMAND="my-deepseek-bridge"
+DEEPSEEK_API_KEY="..." npm start -- --engine deepseek-harness
 ```
 
-外部桥接协议见 [docs/engine-bridge.md](docs/engine-bridge.md)。
+可以覆盖原生启动命令：
+
+```bash
+CODEAGENT_COMMAND="/opt/codex app-server --stdio"
+DEEPSEEK_HARNESS_COMMAND="/opt/dsh --profile acp"
+```
+
+Codex 映射说明见 [docs/codex-app-server.md](docs/codex-app-server.md)，DeepSeek Harness 使用的 ACP 映射见 [docs/acp.md](docs/acp.md)。
+
+`opencode` 在只设置 `OPENCODE_COMMAND` 时使用外部 JSONL 子进程适配器：
+
+```bash
+OPENCODE_COMMAND="my-opencode-bridge" npm start -- --engine opencode
+```
+
+也可以对任意内置引擎显式设置 `*_PROTOCOL=reference|jsonl|acp|codex`。外部 JSONL 桥接协议见 [docs/engine-bridge.md](docs/engine-bridge.md)。
 
 ### ACP Agent
 
@@ -72,7 +95,7 @@ curl -N http://127.0.0.1:3000/v1/events
 
 反问响应 body 为 `{"answer":"..."}`；权限响应 body 为 `{"decision":"allow"}` 或 `{"decision":"deny"}`。
 
-内置参考引擎提供验收标记：`[[ask:问题]]`、`[[permission:操作]]`、`[[slow:毫秒]]`、`[[error:信息]]` 和 `[[pwd]]`。
+需要本地演示或测试参考实现时，可以显式设置 `CODEAGENT_PROTOCOL=reference`。参考引擎提供验收标记：`[[ask:问题]]`、`[[permission:操作]]`、`[[slow:毫秒]]`、`[[error:信息]]` 和 `[[pwd]]`。
 
 ## 验证
 
