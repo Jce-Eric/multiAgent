@@ -1,7 +1,6 @@
-import { mkdirSync } from "node:fs";
-import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { GatewayError } from "./errors.js";
+import { resolveSqliteDatabase, type SqliteDatabase } from "./sqlite-database.js";
 import type { Run, RunError, RunStatus } from "./types.js";
 import { now } from "./utils.js";
 
@@ -64,12 +63,14 @@ interface RunRow {
 
 export class SqliteRunRepository implements RunRepository {
   private readonly database: DatabaseSync;
+  private readonly sqlite: SqliteDatabase;
+  private readonly ownsDatabase: boolean;
 
-  constructor(databasePath: string) {
-    const resolved = path.resolve(databasePath);
-    mkdirSync(path.dirname(resolved), { recursive: true });
-    this.database = new DatabaseSync(resolved);
-    this.database.exec("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;");
+  constructor(databasePath: string | SqliteDatabase) {
+    const resolved = resolveSqliteDatabase(databasePath);
+    this.sqlite = resolved.sqlite;
+    this.ownsDatabase = resolved.ownsDatabase;
+    this.database = this.sqlite.connection;
     this.database.exec(`
       CREATE TABLE IF NOT EXISTS runs (
         id TEXT PRIMARY KEY,
@@ -170,7 +171,7 @@ export class SqliteRunRepository implements RunRepository {
   }
 
   close(): void {
-    this.database.close();
+    if (this.ownsDatabase) this.sqlite.close();
   }
 
   private values(run: Run): [

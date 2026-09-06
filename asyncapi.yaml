@@ -1,7 +1,7 @@
 asyncapi: 3.0.0
 info:
   title: Multi-Agent Gateway Events
-  version: 0.6.0
+  version: 0.7.0
   description: Canonical SSE events emitted by the multi-agent gateway.
 servers:
   local:

@@ -1,7 +1,6 @@
-import { mkdirSync } from "node:fs";
-import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { GatewayError } from "./errors.js";
+import { resolveSqliteDatabase, type SqliteDatabase } from "./sqlite-database.js";
 import type {
   Interaction,
   InteractionStatus,
@@ -76,12 +75,14 @@ interface InteractionRow {
 
 export class SqliteInteractionRepository implements InteractionRepository {
   private readonly database: DatabaseSync;
+  private readonly sqlite: SqliteDatabase;
+  private readonly ownsDatabase: boolean;
 
-  constructor(databasePath: string) {
-    const resolved = path.resolve(databasePath);
-    mkdirSync(path.dirname(resolved), { recursive: true });
-    this.database = new DatabaseSync(resolved);
-    this.database.exec("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;");
+  constructor(databasePath: string | SqliteDatabase) {
+    const resolved = resolveSqliteDatabase(databasePath);
+    this.sqlite = resolved.sqlite;
+    this.ownsDatabase = resolved.ownsDatabase;
+    this.database = this.sqlite.connection;
     this.database.exec(`
       CREATE TABLE IF NOT EXISTS interactions (
         id TEXT PRIMARY KEY,
@@ -183,7 +184,7 @@ export class SqliteInteractionRepository implements InteractionRepository {
   }
 
   close(): void {
-    this.database.close();
+    if (this.ownsDatabase) this.sqlite.close();
   }
 
   private values(interaction: Interaction): [

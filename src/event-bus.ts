@@ -6,6 +6,7 @@ export type EventListener = (event: GatewayEvent) => void;
 
 export class EventBus {
   private readonly listeners = new Set<EventListener>();
+  private readonly transactionBuffers: GatewayEvent[][] = [];
 
   constructor(
     historyLimit = 1_000,
@@ -26,10 +27,26 @@ export class EventBus {
       data,
     });
 
-    for (const listener of this.listeners) {
-      listener(event);
-    }
+    const buffer = this.transactionBuffers.at(-1);
+    if (buffer) buffer.push(event);
+    else this.notify(event);
     return event;
+  }
+
+  afterCommit<T>(operation: () => T): T {
+    const buffer: GatewayEvent[] = [];
+    this.transactionBuffers.push(buffer);
+    try {
+      const result = operation();
+      this.transactionBuffers.pop();
+      const parent = this.transactionBuffers.at(-1);
+      if (parent) parent.push(...buffer);
+      else for (const event of buffer) this.notify(event);
+      return result;
+    } catch (error) {
+      this.transactionBuffers.pop();
+      throw error;
+    }
   }
 
   subscribe(listener: EventListener): () => void {
@@ -47,5 +64,15 @@ export class EventBus {
 
   close(): void {
     this.repository.close();
+  }
+
+  private notify(event: GatewayEvent): void {
+    for (const listener of this.listeners) {
+      try {
+        listener(event);
+      } catch {
+        // Event persistence has already succeeded; one subscriber must not break the publisher.
+      }
+    }
   }
 }

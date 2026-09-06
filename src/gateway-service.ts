@@ -8,6 +8,10 @@ import {
 } from "./interaction-store.js";
 import { MemoryRunRepository, type RunRepository } from "./run-store.js";
 import { MemorySessionRepository, type SessionRepository } from "./session-store.js";
+import {
+  NoopTransactionCoordinator,
+  type TransactionCoordinator,
+} from "./sqlite-database.js";
 import type {
   InteractionType,
   Interaction,
@@ -59,6 +63,7 @@ export interface GatewayServiceOptions {
   repository?: SessionRepository;
   runRepository?: RunRepository;
   interactionRepository?: InteractionRepository;
+  transactionCoordinator?: TransactionCoordinator;
   workspaceResolver?: WorkspaceResolver;
 }
 
@@ -70,6 +75,7 @@ export class GatewayService {
   readonly engineCatalog: EngineCatalogLike;
   private readonly activeRuns = new Map<string, ActiveRun>();
   private readonly idleTimers = new Map<string, NodeJS.Timeout>();
+  private readonly rollbackFrames: Array<Map<object, object>> = [];
   private readonly generationTimeoutMs: number;
   private readonly idleSessionTimeoutMs: number;
   private readonly maxConcurrentRuns: number;
@@ -77,6 +83,7 @@ export class GatewayService {
   private readonly maxSessions: number;
   private readonly permissionPolicy: PermissionPolicy;
   private readonly workspaceResolver: WorkspaceResolver;
+  private readonly transactionCoordinator: TransactionCoordinator;
   private shuttingDown = false;
 
   constructor(
@@ -90,6 +97,7 @@ export class GatewayService {
     this.repository = options.repository ?? new MemorySessionRepository();
     this.runs = options.runRepository ?? new MemoryRunRepository();
     this.interactions = options.interactionRepository ?? new MemoryInteractionRepository();
+    this.transactionCoordinator = options.transactionCoordinator ?? new NoopTransactionCoordinator();
     this.workspaceResolver = options.workspaceResolver ?? new WorkspaceResolver(
       defaultDirectory,
       options.allowedRoots ?? [],
@@ -135,12 +143,14 @@ export class GatewayService {
       messages: [],
     });
     try {
-      this.repository.add(session);
+      this.atomic(() => {
+        this.repository.add(session);
+        this.events.publish("session.created", this.snapshot(session), { sessionId: session.id });
+      });
     } catch (error) {
       await Promise.resolve(engine.closeSession?.(session.id)).catch(() => undefined);
       throw error;
     }
-    this.events.publish("session.created", this.snapshot(session), { sessionId: session.id });
     this.scheduleIdleClose(session.id);
     return this.snapshot(session);
   }
@@ -189,7 +199,7 @@ export class GatewayService {
     const run = this.activeRuns.get(id);
     if (run) {
       if (run.started) {
-        this.setRunStatus(run.record, "canceling");
+        this.atomic(() => this.setRunStatus(run.record, "canceling"));
         this.abortRun(run, "user");
       } else {
         this.cancelQueuedRun(session, run, "user");
@@ -198,8 +208,10 @@ export class GatewayService {
     }
     this.clearIdleTimer(id);
     await this.engineCatalog.find(session.engine)?.closeSession?.(id);
-    this.repository.delete(id);
-    this.events.publish("session.deleted", { id: session.id }, { sessionId: session.id });
+    this.atomic(() => {
+      this.repository.delete(id);
+      this.events.publish("session.deleted", { id: session.id }, { sessionId: session.id });
+    });
   }
 
   sendMessage(sessionId: string, content: string): { runId: string } {
@@ -218,10 +230,10 @@ export class GatewayService {
     }
 
     this.clearIdleTimer(sessionId);
+    const nextSession = this.snapshot(session);
     const userMessage = this.createMessage("user", content, "completed");
-    session.messages.push(userMessage);
-    session.updatedAt = now();
-    this.repository.save(session);
+    nextSession.messages.push(userMessage);
+    nextSession.updatedAt = now();
     const timestamp = now();
     const record: Run = {
       id: randomUUID(),
@@ -231,7 +243,6 @@ export class GatewayService {
       createdAt: timestamp,
       updatedAt: timestamp,
     };
-    this.runs.add(record);
     const run: ActiveRun = {
       record,
       engine,
@@ -242,9 +253,19 @@ export class GatewayService {
       started: false,
     };
     this.activeRuns.set(sessionId, run);
-    this.setStatus(session, "busy", record.id);
-    this.events.publish("message.user", userMessage, { sessionId, runId: record.id });
-    this.events.publish("run.created", this.snapshotRun(record), { sessionId, runId: record.id });
+    try {
+      this.atomic(() => {
+        this.repository.save(nextSession);
+        this.runs.add(record);
+        this.setStatus(nextSession, "busy", record.id);
+        this.events.publish("message.user", userMessage, { sessionId, runId: record.id });
+        this.events.publish("run.created", this.snapshotRun(record), { sessionId, runId: record.id });
+      });
+    } catch (error) {
+      this.activeRuns.delete(sessionId);
+      this.scheduleIdleClose(sessionId);
+      throw error;
+    }
     this.drainRunQueue();
     return { runId: record.id };
   }
@@ -282,23 +303,24 @@ export class GatewayService {
       );
     }
     this.validateInteractionResponse(interaction.record.type, response);
+    const becomesRunning = run.interactions.size === 1 && !run.controller.signal.aborted;
+    this.atomic(() => {
+      this.resolveInteraction(interaction.record, response, "client");
+      this.events.publish(
+        "interaction.resolved",
+        {
+          requestId,
+          interactionType: interaction.record.type,
+          status: "resolved",
+          response,
+          resolvedBy: "client",
+        },
+        { sessionId, runId: run.record.id },
+      );
+      if (becomesRunning) this.setRunStatus(run.record, "running");
+    });
     run.interactions.delete(requestId);
-    this.resolveInteraction(interaction.record, response, "client");
     interaction.value.resolve(response);
-    this.events.publish(
-      "interaction.resolved",
-      {
-        requestId,
-        interactionType: interaction.record.type,
-        status: "resolved",
-        response,
-        resolvedBy: "client",
-      },
-      { sessionId, runId: run.record.id },
-    );
-    if (run.interactions.size === 0 && !run.controller.signal.aborted) {
-      this.setRunStatus(run.record, "running");
-    }
   }
 
   stopSession(sessionId: string): { runId: string } {
@@ -311,7 +333,7 @@ export class GatewayService {
       this.cancelQueuedRun(session, run, "user");
       return { runId: run.record.id };
     }
-    this.setRunStatus(run.record, "canceling");
+    this.atomic(() => this.setRunStatus(run.record, "canceling"));
     this.abortRun(run, "user");
     return { runId: run.record.id };
   }
@@ -340,7 +362,7 @@ export class GatewayService {
     this.idleTimers.clear();
     for (const run of [...this.activeRuns.values()]) {
       if (run.started) {
-        this.setRunStatus(run.record, "canceling");
+        this.atomic(() => this.setRunStatus(run.record, "canceling"));
         this.abortRun(run, "shutdown");
       } else {
         const session = this.repository.get(run.record.sessionId);
@@ -357,6 +379,7 @@ export class GatewayService {
     this.runs.close();
     this.interactions.close();
     this.events.close();
+    this.transactionCoordinator.close();
   }
 
   private async executeRun(session: Session, run: ActiveRun): Promise<void> {
@@ -395,18 +418,22 @@ export class GatewayService {
         });
       }
       const message = this.createMessage("assistant", accumulated, "completed");
-      session.messages.push(message);
-      session.updatedAt = now();
-      this.repository.save(session);
-      this.events.publish("message.assistant.completed", message, {
-        sessionId: session.id,
-        runId: run.record.id,
-      });
-      run.record.outputMessageId = message.id;
-      this.setRunStatus(run.record, "completed");
-      this.events.publish("generation.completed", { messageId: message.id }, {
-        sessionId: session.id,
-        runId: run.record.id,
+      this.atomic(() => {
+        this.trackMutation(session);
+        this.trackMutation(run.record);
+        session.messages.push(message);
+        session.updatedAt = now();
+        this.repository.save(session);
+        this.events.publish("message.assistant.completed", message, {
+          sessionId: session.id,
+          runId: run.record.id,
+        });
+        run.record.outputMessageId = message.id;
+        this.setRunStatus(run.record, "completed");
+        this.events.publish("generation.completed", { messageId: message.id }, {
+          sessionId: session.id,
+          runId: run.record.id,
+        });
       });
     } catch (error) {
       if (run.abortReason === "timeout") {
@@ -415,74 +442,54 @@ export class GatewayService {
           message: `Generation exceeded ${this.generationTimeoutMs}ms`,
           partialContent: accumulated,
         };
-        if (accumulated) {
-          const message = this.createMessage("assistant", accumulated, "stopped");
-          session.messages.push(message);
-          session.updatedAt = now();
-          this.repository.save(session);
-          this.events.publish("message.assistant.completed", message, {
+        this.atomic(() => {
+          if (accumulated) this.persistPartialMessage(session, run, accumulated);
+          this.setRunStatus(run.record, "failed", { error: normalized });
+          this.events.publish("error", normalized, { sessionId: session.id, runId: run.record.id });
+          this.events.publish("generation.failed", normalized, {
             sessionId: session.id,
             runId: run.record.id,
           });
-          run.record.outputMessageId = message.id;
-        }
-        this.setRunStatus(run.record, "failed", { error: normalized });
-        this.events.publish("error", normalized, { sessionId: session.id, runId: run.record.id });
-        this.events.publish("generation.failed", normalized, {
-          sessionId: session.id,
-          runId: run.record.id,
         });
       } else if (isAbortError(error) || run.controller.signal.aborted) {
-        if (accumulated) {
-          const message = this.createMessage("assistant", accumulated, "stopped");
-          session.messages.push(message);
-          session.updatedAt = now();
-          this.repository.save(session);
-          this.events.publish("message.assistant.completed", message, {
-            sessionId: session.id,
-            runId: run.record.id,
+        this.atomic(() => {
+          if (accumulated) this.persistPartialMessage(session, run, accumulated);
+          this.setRunStatus(run.record, "canceled", {
+            stopReason: run.abortReason ?? "user",
           });
-          run.record.outputMessageId = message.id;
-        }
-        this.setRunStatus(run.record, "canceled", {
-          stopReason: run.abortReason ?? "user",
+          this.events.publish(
+            "generation.stopped",
+            { partialContent: accumulated, reason: run.abortReason ?? "user" },
+            { sessionId: session.id, runId: run.record.id },
+          );
         });
-        this.events.publish(
-          "generation.stopped",
-          { partialContent: accumulated, reason: run.abortReason ?? "user" },
-          { sessionId: session.id, runId: run.record.id },
-        );
       } else {
         const normalized = this.normalizeEngineError(error);
-        if (accumulated) {
-          const message = this.createMessage("assistant", accumulated, "stopped");
-          session.messages.push(message);
-          session.updatedAt = now();
-          this.repository.save(session);
-          this.events.publish("message.assistant.completed", message, {
+        this.atomic(() => {
+          if (accumulated) this.persistPartialMessage(session, run, accumulated);
+          this.setRunStatus(run.record, "failed", { error: normalized });
+          this.events.publish("error", normalized, { sessionId: session.id, runId: run.record.id });
+          this.events.publish("generation.failed", normalized, {
             sessionId: session.id,
             runId: run.record.id,
           });
-          run.record.outputMessageId = message.id;
-        }
-        this.setRunStatus(run.record, "failed", { error: normalized });
-        this.events.publish("error", normalized, { sessionId: session.id, runId: run.record.id });
-        this.events.publish("generation.failed", normalized, {
-          sessionId: session.id,
-          runId: run.record.id,
         });
       }
     } finally {
       if (run.timeout) clearTimeout(run.timeout);
+      this.atomic(() => {
+        for (const interaction of run.interactions.values()) {
+          this.cancelInteraction(interaction.record, run.abortReason ?? "run_ended");
+        }
+        this.setStatus(session, "idle", run.record.id);
+      });
       for (const interaction of run.interactions.values()) {
-        this.cancelInteraction(interaction.record, run.abortReason ?? "run_ended");
         interaction.value.reject(new AbortGenerationError());
       }
       run.interactions.clear();
       if (this.activeRuns.get(session.id)?.record.id === run.record.id) {
         this.activeRuns.delete(session.id);
       }
-      this.setStatus(session, "idle", run.record.id);
       this.scheduleIdleClose(session.id);
       run.finished.resolve();
       this.drainRunQueue();
@@ -501,15 +508,23 @@ export class GatewayService {
       metadata: input.metadata,
     };
     const interaction = this.registerInteraction(session, run, "question", data);
-    this.setRunStatus(run.record, "input_required");
-    this.events.publish(
-      "interaction.question",
-      {
-        requestId: interaction.record.id,
-        ...data,
-      },
-      { sessionId: session.id, runId: run.record.id },
-    );
+    try {
+      this.atomic(() => {
+        this.interactions.add(interaction.record);
+        this.setRunStatus(run.record, "input_required");
+        this.events.publish(
+          "interaction.question",
+          {
+            requestId: interaction.record.id,
+            ...data,
+          },
+          { sessionId: session.id, runId: run.record.id },
+        );
+      });
+    } catch (error) {
+      run.interactions.delete(interaction.record.id);
+      throw error;
+    }
     return interaction.value.promise as Promise<QuestionResponse>;
   }
 
@@ -525,32 +540,42 @@ export class GatewayService {
       metadata: input.metadata,
     };
     const interaction = this.registerInteraction(session, run, "permission", data);
-    this.setRunStatus(run.record, "input_required");
-    this.events.publish(
-      "interaction.permission",
-      {
-        requestId: interaction.record.id,
-        ...data,
-      },
-      { sessionId: session.id, runId: run.record.id },
-    );
+    try {
+      this.atomic(() => {
+        this.interactions.add(interaction.record);
+        this.setRunStatus(run.record, "input_required");
+        this.events.publish(
+          "interaction.permission",
+          {
+            requestId: interaction.record.id,
+            ...data,
+          },
+          { sessionId: session.id, runId: run.record.id },
+        );
+      });
+    } catch (error) {
+      run.interactions.delete(interaction.record.id);
+      throw error;
+    }
     if (this.permissionPolicy !== "client") {
       const response: PermissionResponse = { decision: this.permissionPolicy };
+      this.atomic(() => {
+        this.resolveInteraction(interaction.record, response, "policy");
+        this.events.publish(
+          "interaction.resolved",
+          {
+            requestId: interaction.record.id,
+            interactionType: "permission",
+            status: "resolved",
+            response,
+            resolvedBy: "policy",
+          },
+          { sessionId: session.id, runId: run.record.id },
+        );
+        this.setRunStatus(run.record, "running");
+      });
       run.interactions.delete(interaction.record.id);
-      this.resolveInteraction(interaction.record, response, "policy");
       interaction.value.resolve(response);
-      this.events.publish(
-        "interaction.resolved",
-        {
-          requestId: interaction.record.id,
-          interactionType: "permission",
-          status: "resolved",
-          response,
-          resolvedBy: "policy",
-        },
-        { sessionId: session.id, runId: run.record.id },
-      );
-      this.setRunStatus(run.record, "running");
     }
     return interaction.value.promise as Promise<PermissionResponse>;
   }
@@ -577,7 +602,6 @@ export class GatewayService {
       record,
       value: deferred<InteractionResponse>(),
     };
-    this.interactions.add(record);
     run.interactions.set(record.id, interaction);
     return interaction;
   }
@@ -617,10 +641,14 @@ export class GatewayService {
 
   private abortRun(run: ActiveRun, reason: AbortReason): void {
     if (run.controller.signal.aborted) return;
+    this.atomic(() => {
+      for (const interaction of run.interactions.values()) {
+        this.cancelInteraction(interaction.record, reason);
+      }
+    });
     run.abortReason = reason;
     run.controller.abort();
     for (const interaction of run.interactions.values()) {
-      this.cancelInteraction(interaction.record, reason);
       interaction.value.reject(new AbortGenerationError());
     }
     run.interactions.clear();
@@ -628,13 +656,16 @@ export class GatewayService {
 
   private setStatus(session: Session, status: Session["status"], runId?: string): void {
     if (session.status === status) return;
-    const previous = session.status;
-    session.status = status;
-    session.updatedAt = now();
-    this.repository.save(session);
-    this.events.publish("session.status.changed", { previous, status }, {
-      sessionId: session.id,
-      runId,
+    this.atomic(() => {
+      this.trackMutation(session);
+      const previous = session.status;
+      session.status = status;
+      session.updatedAt = now();
+      this.repository.save(session);
+      this.events.publish("session.status.changed", { previous, status }, {
+        sessionId: session.id,
+        runId,
+      });
     });
   }
 
@@ -649,12 +680,14 @@ export class GatewayService {
         run.timeout = setTimeout(() => this.abortRun(run, "timeout"), this.generationTimeoutMs);
         run.timeout.unref();
       }
-      this.setRunStatus(run.record, "running");
-      this.events.publish(
-        "generation.started",
-        { engine: run.engine.name, directory: session.directory },
-        { sessionId: session.id, runId: run.record.id },
-      );
+      this.atomic(() => {
+        this.setRunStatus(run.record, "running");
+        this.events.publish(
+          "generation.started",
+          { engine: run.engine.name, directory: session.directory },
+          { sessionId: session.id, runId: run.record.id },
+        );
+      });
       void this.executeRun(session, run);
     }
   }
@@ -662,16 +695,18 @@ export class GatewayService {
   private cancelQueuedRun(session: Session, run: ActiveRun, reason: AbortReason): void {
     if (run.started || run.record.status !== "queued") return;
     run.abortReason = reason;
-    this.setRunStatus(run.record, "canceling");
+    this.atomic(() => {
+      this.setRunStatus(run.record, "canceling");
+      this.setRunStatus(run.record, "canceled", { stopReason: reason });
+      this.events.publish(
+        "generation.stopped",
+        { partialContent: "", reason },
+        { sessionId: session.id, runId: run.record.id },
+      );
+      this.setStatus(session, "idle", run.record.id);
+    });
     run.controller.abort();
-    this.setRunStatus(run.record, "canceled", { stopReason: reason });
-    this.events.publish(
-      "generation.stopped",
-      { partialContent: "", reason },
-      { sessionId: session.id, runId: run.record.id },
-    );
     this.activeRuns.delete(session.id);
-    this.setStatus(session, "idle", run.record.id);
     this.scheduleIdleClose(session.id);
     run.finished.resolve();
     this.drainRunQueue();
@@ -686,6 +721,7 @@ export class GatewayService {
     response: InteractionResponse,
     resolvedBy: "client" | "policy",
   ): void {
+    this.trackMutation(interaction);
     const timestamp = now();
     interaction.status = "resolved";
     interaction.response = response;
@@ -697,6 +733,7 @@ export class GatewayService {
 
   private cancelInteraction(interaction: Interaction, reason: string): void {
     if (interaction.status !== "pending") return;
+    this.trackMutation(interaction);
     const timestamp = now();
     interaction.status = "canceled";
     interaction.cancelReason = reason;
@@ -721,20 +758,23 @@ export class GatewayService {
     update: { error?: RunError; stopReason?: string } = {},
   ): void {
     if (run.status === status && update.error === undefined && update.stopReason === undefined) return;
-    const previous = run.status;
-    run.status = status;
-    run.updatedAt = now();
-    if (update.error !== undefined) run.error = update.error;
-    if (update.stopReason !== undefined) run.stopReason = update.stopReason;
-    if (status === "completed" || status === "failed" || status === "canceled") {
-      run.completedAt = run.updatedAt;
-    }
-    this.runs.save(run);
-    this.events.publish(
-      "run.status.changed",
-      { previous, status, run: this.snapshotRun(run) },
-      { sessionId: run.sessionId, runId: run.id },
-    );
+    this.atomic(() => {
+      this.trackMutation(run);
+      const previous = run.status;
+      run.status = status;
+      run.updatedAt = now();
+      if (update.error !== undefined) run.error = update.error;
+      if (update.stopReason !== undefined) run.stopReason = update.stopReason;
+      if (status === "completed" || status === "failed" || status === "canceled") {
+        run.completedAt = run.updatedAt;
+      }
+      this.runs.save(run);
+      this.events.publish(
+        "run.status.changed",
+        { previous, status, run: this.snapshotRun(run) },
+        { sessionId: run.sessionId, runId: run.id },
+      );
+    });
   }
 
   private scheduleIdleClose(sessionId: string): void {
@@ -788,6 +828,20 @@ export class GatewayService {
     };
   }
 
+  private persistPartialMessage(session: Session, run: ActiveRun, content: string): void {
+    this.trackMutation(session);
+    this.trackMutation(run.record);
+    const message = this.createMessage("assistant", content, "stopped");
+    session.messages.push(message);
+    session.updatedAt = now();
+    this.repository.save(session);
+    this.events.publish("message.assistant.completed", message, {
+      sessionId: session.id,
+      runId: run.record.id,
+    });
+    run.record.outputMessageId = message.id;
+  }
+
   private snapshot(session: Session): Session {
     return {
       ...session,
@@ -824,5 +878,38 @@ export class GatewayService {
       code: "ENGINE_PROCESS_ERROR",
       message: error instanceof Error ? error.message : "Unknown engine error",
     };
+  }
+
+  private atomic<T>(operation: () => T): T {
+    const frame = new Map<object, object>();
+    this.rollbackFrames.push(frame);
+    try {
+      const result = this.events.afterCommit(() => this.transactionCoordinator.transaction(operation));
+      this.rollbackFrames.pop();
+      const parent = this.rollbackFrames.at(-1);
+      if (parent) {
+        for (const [target, snapshot] of frame) {
+          if (!parent.has(target)) parent.set(target, snapshot);
+        }
+      }
+      return result;
+    } catch (error) {
+      this.rollbackFrames.pop();
+      for (const [target, snapshot] of [...frame.entries()].reverse()) {
+        this.restoreObject(target, snapshot);
+      }
+      throw error;
+    }
+  }
+
+  private trackMutation<T extends object>(target: T): void {
+    const frame = this.rollbackFrames.at(-1);
+    if (frame && !frame.has(target)) frame.set(target, structuredClone(target));
+  }
+
+  private restoreObject(target: object, snapshot: object): void {
+    const mutable = target as Record<string, unknown>;
+    for (const key of Object.keys(mutable)) delete mutable[key];
+    Object.assign(mutable, structuredClone(snapshot));
   }
 }

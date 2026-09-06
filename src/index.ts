@@ -59,3 +59,8 @@ export type {
   WorkspaceRef,
 } from "./types.js";
 export { WorkspaceResolver } from "./workspace.js";
+export {
+  NoopTransactionCoordinator,
+  SqliteDatabase,
+  type TransactionCoordinator,
+} from "./sqlite-database.js";

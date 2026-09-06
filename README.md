@@ -138,6 +138,10 @@ GATEWAY_DATABASE_PATH=./data/gateway.db npm start -- --engine opencode
 
 SQLite 使用 WAL。重启时遗留的 `busy` Session 会恢复为 `idle`，未完成 Run 会恢复为 `failed`，未回答的 Interaction 会标记为 `canceled`。原生 Agent 进程被空闲回收或服务重启后，下一次生成会创建新原生 Session，并用已保存消息做一次上下文回放。
 
+从 v0.7.0 开始，标准 `createApp()` SQLite 配置让 Session、Run、Interaction 和事件仓储共享同一连接。一次状态转换涉及的领域数据与 `gateway_events` 事件日志在同一个同步事务中提交；事务失败时全部回滚，SSE 订阅者只会在提交完成后收到事件。这样客户端不会看到数据库中并不存在的中间状态。
+
+手动注入仓储仍保留兼容行为。若需要相同的跨仓储原子性，应让仓储共享一个 `SqliteDatabase`，并把它作为 `transactionCoordinator` 传给 `GatewayService`。当前提交后通知面向单进程实例；跨实例事件分发仍需要外部 relay 或消息系统。
+
 ## 安全和资源策略
 
 ```bash

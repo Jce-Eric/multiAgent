@@ -2,7 +2,7 @@
 
 Date: 2026-09-06
 
-The v0.5 design was selected after ten independent review passes. The v0.6 iteration adds persisted Interaction resources and FIFO Run scheduling while preserving the same client workflows.
+The v0.5 design was selected after ten independent review passes. The v0.6 iteration added persisted Interaction resources and FIFO Run scheduling. The v0.7 iteration adds atomic SQLite state transitions and post-commit event delivery while preserving the same client workflows.
 
 ## Ten review passes
 
@@ -27,12 +27,14 @@ The v0.5 design was selected after ten independent review passes. The v0.6 itera
 - SQLite mode preserves sessions, Runs, and the SSE cursor across gateway restarts.
 - v0.6 persists Interaction audit records and cancels orphaned pending requests on restart.
 - v0.6 uses the existing `queued` Run state for FIFO admission instead of rejecting excess concurrency.
+- v0.7 shares one SQLite connection across the standard repositories and atomically commits domain state with the durable event log.
+- v0.7 delivers in-process SSE notifications only after commit and discards notifications for rolled-back events.
+- v0.7 restores mutated in-memory Session, Run, and Interaction objects when a transactional write fails.
 
 ## Deferred work
 
-- Transactional outbox across Session, Run, Message, and Event writes.
 - Restartable human-in-the-loop execution using native Agent checkpoint handles.
 - Artifact storage and content-part upload APIs.
 - A2A remote driver and native checkpoint/resume handles.
-- PostgreSQL repositories, runtime ownership leases, and cross-instance event fanout.
+- PostgreSQL repositories, runtime ownership leases, and cross-instance outbox relay/fanout.
 - Isolated sidecar plugin manifests and a driver conformance kit.

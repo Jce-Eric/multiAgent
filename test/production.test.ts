@@ -6,10 +6,14 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { createApp } from "../src/app.js";
+import { ReferenceEngine } from "../src/engines/reference-engine.js";
+import { EventBus } from "../src/event-bus.js";
+import { SqliteEventRepository } from "../src/event-store.js";
+import { GatewayService } from "../src/gateway-service.js";
 import { SqliteInteractionRepository } from "../src/interaction-store.js";
 import { SqliteRunRepository } from "../src/run-store.js";
 import { SqliteSessionRepository } from "../src/session-store.js";
-import type { EventBus } from "../src/event-bus.js";
+import { SqliteDatabase } from "../src/sqlite-database.js";
 import type { GatewayEvent, GatewayEventType, Session } from "../src/types.js";
 
 const referenceEnv = {
@@ -114,6 +118,128 @@ test("SQLite persists runs and replayable gateway events across restarts", async
     assert.equal(recovered.get("interrupted-run").error?.code, "GATEWAY_RESTARTED");
     recovered.close();
   } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test("SQLite transaction rolls back domain writes and hides uncommitted events", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "gateway-outbox-"));
+  const databasePath = path.join(root, "gateway.db");
+  const sqlite = new SqliteDatabase(databasePath);
+  const sessions = new SqliteSessionRepository(sqlite);
+  const runs = new SqliteRunRepository(sqlite);
+  const interactions = new SqliteInteractionRepository(sqlite);
+  const eventRepository = new SqliteEventRepository(sqlite);
+  const events = new EventBus(1_000, eventRepository);
+  const service = new GatewayService(
+    new ReferenceEngine("codeagent", "CodeAgent"),
+    events,
+    root,
+    {
+      repository: sessions,
+      runRepository: runs,
+      interactionRepository: interactions,
+      transactionCoordinator: sqlite,
+    },
+  );
+  try {
+    const session = await service.createSession(root);
+    const delivered: GatewayEvent[] = [];
+    const unsubscribe = events.subscribe((event) => {
+      assert.equal(sqlite.connection.isTransaction, false);
+      delivered.push(event);
+    });
+    sqlite.connection.exec(`
+      CREATE TRIGGER reject_run_created
+      BEFORE INSERT ON gateway_events
+      WHEN NEW.type = 'run.created'
+      BEGIN
+        SELECT RAISE(ABORT, 'forced outbox failure');
+      END;
+    `);
+
+    assert.throws(
+      () => service.sendMessage(session.id, "must roll back"),
+      (error: any) => error?.code === "PERSISTENCE_ERROR",
+    );
+    assert.equal(service.getSession(session.id).status, "idle");
+    assert.equal(service.getSession(session.id).messages.length, 0);
+    assert.equal(service.listRuns(session.id).length, 0);
+    assert.equal(delivered.length, 0);
+    assert.equal(
+      events.eventsAfter(0, session.id).filter((event) => event.type !== "session.created").length,
+      0,
+    );
+
+    sqlite.connection.exec("DROP TRIGGER reject_run_created");
+    const unsubscribeFailing = events.subscribe(() => {
+      throw new Error("subscriber failure must not break publishers");
+    });
+    const accepted = service.sendMessage(session.id, "works after rollback");
+    await waitForEvent(events, "generation.completed", (event) => event.runId === accepted.runId);
+    assert(delivered.some((event) => event.type === "run.created" && event.runId === accepted.runId));
+    unsubscribeFailing();
+
+    const interactionSession = await service.createSession(root);
+    sqlite.connection.exec(`
+      CREATE TRIGGER reject_interaction_question
+      BEFORE INSERT ON gateway_events
+      WHEN NEW.type = 'interaction.question'
+      BEGIN
+        SELECT RAISE(ABORT, 'forced interaction outbox failure');
+      END;
+    `);
+    const interactionRun = service.sendMessage(interactionSession.id, "[[ask:branch?]]");
+    await waitForEvent(
+      events,
+      "generation.failed",
+      (event) => event.runId === interactionRun.runId,
+    );
+    assert.equal(service.listInteractions(interactionSession.id).length, 0);
+    const failedTransition = events.eventsAfter(0, interactionSession.id).find(
+      (event) =>
+        event.type === "run.status.changed" &&
+        event.runId === interactionRun.runId &&
+        (event.data as any).status === "failed",
+    );
+    assert.equal((failedTransition?.data as any).previous, "running");
+    sqlite.connection.exec("DROP TRIGGER reject_interaction_question");
+    unsubscribe();
+  } finally {
+    await service.shutdown();
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test("SQLite nested transactions use savepoints and reject async callbacks", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "gateway-savepoints-"));
+  const sqlite = new SqliteDatabase(path.join(root, "gateway.db"));
+  try {
+    sqlite.connection.exec("CREATE TABLE values_table (value INTEGER NOT NULL)");
+    sqlite.transaction(() => {
+      sqlite.connection.prepare("INSERT INTO values_table VALUES (?)").run(1);
+      assert.throws(
+        () => sqlite.transaction(() => {
+          sqlite.connection.prepare("INSERT INTO values_table VALUES (?)").run(2);
+          throw new Error("roll back nested write");
+        }),
+        /roll back nested write/,
+      );
+      sqlite.connection.prepare("INSERT INTO values_table VALUES (?)").run(3);
+    });
+
+    assert.deepEqual(
+      sqlite.connection.prepare("SELECT value FROM values_table ORDER BY value").all()
+        .map((row) => row.value),
+      [1, 3],
+    );
+    assert.throws(
+      () => sqlite.transaction(() => Promise.resolve()),
+      /must be synchronous/,
+    );
+    assert.equal(sqlite.connection.isTransaction, false);
+  } finally {
+    sqlite.close();
     await fs.rm(root, { recursive: true, force: true });
   }
 });

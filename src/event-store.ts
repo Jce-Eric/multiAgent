@@ -1,7 +1,6 @@
-import { mkdirSync } from "node:fs";
-import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { GatewayError } from "./errors.js";
+import { resolveSqliteDatabase, type SqliteDatabase } from "./sqlite-database.js";
 import type { GatewayEvent, GatewayEventType } from "./types.js";
 
 export type NewGatewayEvent = Omit<GatewayEvent, "id">;
@@ -52,12 +51,17 @@ interface EventRow {
 
 export class SqliteEventRepository implements EventRepository {
   private readonly database: DatabaseSync;
+  private readonly sqlite: SqliteDatabase;
+  private readonly ownsDatabase: boolean;
 
-  constructor(databasePath: string, private readonly historyLimit = 1_000) {
-    const resolved = path.resolve(databasePath);
-    mkdirSync(path.dirname(resolved), { recursive: true });
-    this.database = new DatabaseSync(resolved);
-    this.database.exec("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;");
+  constructor(
+    databasePath: string | SqliteDatabase,
+    private readonly historyLimit = 1_000,
+  ) {
+    const resolved = resolveSqliteDatabase(databasePath);
+    this.sqlite = resolved.sqlite;
+    this.ownsDatabase = resolved.ownsDatabase;
+    this.database = this.sqlite.connection;
     this.database.exec(`
       CREATE TABLE IF NOT EXISTS gateway_events (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -120,7 +124,7 @@ export class SqliteEventRepository implements EventRepository {
   }
 
   close(): void {
-    this.database.close();
+    if (this.ownsDatabase) this.sqlite.close();
   }
 
   private fromRow(row: EventRow): GatewayEvent {

@@ -10,15 +10,29 @@ import { loadGatewayConfig, type GatewayConfig } from "./config.js";
 import { EngineCatalog } from "./engines/catalog.js";
 import { GatewayError } from "./errors.js";
 import { EventBus } from "./event-bus.js";
-import { createEventRepository, type EventRepository } from "./event-store.js";
+import {
+  createEventRepository,
+  SqliteEventRepository,
+  type EventRepository,
+} from "./event-store.js";
 import { GatewayService } from "./gateway-service.js";
 import {
   createInteractionRepository,
+  SqliteInteractionRepository,
   type InteractionRepository,
 } from "./interaction-store.js";
 import { GatewayMetrics } from "./metrics.js";
-import { createRunRepository, type RunRepository } from "./run-store.js";
-import { createSessionRepository, type SessionRepository } from "./session-store.js";
+import { createRunRepository, SqliteRunRepository, type RunRepository } from "./run-store.js";
+import {
+  createSessionRepository,
+  SqliteSessionRepository,
+  type SessionRepository,
+} from "./session-store.js";
+import {
+  NoopTransactionCoordinator,
+  SqliteDatabase,
+  type TransactionCoordinator,
+} from "./sqlite-database.js";
 import type { GatewayEvent, PermissionResponse, QuestionResponse } from "./types.js";
 import { GATEWAY_VERSION } from "./version.js";
 
@@ -61,16 +75,29 @@ export function createApp(options: AppOptions = {}) {
   const config = { ...loadGatewayConfig(env), ...options.config };
   const engineName = options.engine ?? env.AGENT_ENGINE ?? "codeagent";
   const engineCatalog = new EngineCatalog(engineName, env);
-  const eventRepository = options.eventRepository ?? createEventRepository(
-    config.databasePath,
-    config.eventHistoryLimit,
-  );
+  const canShareDatabase = Boolean(config.databasePath) &&
+    !options.repository &&
+    !options.runRepository &&
+    !options.interactionRepository &&
+    !options.eventRepository;
+  const sharedDatabase = canShareDatabase
+    ? new SqliteDatabase(config.databasePath!)
+    : undefined;
+  const eventRepository = options.eventRepository ?? (sharedDatabase
+    ? new SqliteEventRepository(sharedDatabase, config.eventHistoryLimit)
+    : createEventRepository(config.databasePath, config.eventHistoryLimit));
   const events = new EventBus(config.eventHistoryLimit, eventRepository);
-  const repository = options.repository ?? createSessionRepository(config.databasePath);
-  const runRepository = options.runRepository ?? createRunRepository(config.databasePath);
-  const interactionRepository = options.interactionRepository ?? createInteractionRepository(
-    config.databasePath,
-  );
+  const repository = options.repository ?? (sharedDatabase
+    ? new SqliteSessionRepository(sharedDatabase)
+    : createSessionRepository(config.databasePath));
+  const runRepository = options.runRepository ?? (sharedDatabase
+    ? new SqliteRunRepository(sharedDatabase)
+    : createRunRepository(config.databasePath));
+  const interactionRepository = options.interactionRepository ?? (sharedDatabase
+    ? new SqliteInteractionRepository(sharedDatabase)
+    : createInteractionRepository(config.databasePath));
+  const transactionCoordinator: TransactionCoordinator = sharedDatabase ??
+    new NoopTransactionCoordinator();
   const service = new GatewayService(
     engineCatalog,
     events,
@@ -86,6 +113,7 @@ export function createApp(options: AppOptions = {}) {
       repository,
       runRepository,
       interactionRepository,
+      transactionCoordinator,
     },
   );
   const metrics = new GatewayMetrics(service);
