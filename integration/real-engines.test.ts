@@ -3,6 +3,8 @@ import { once } from "node:events";
 import { createServer, type Server } from "node:http";
 import test from "node:test";
 import { createApp } from "../src/app.js";
+import type { EventBus } from "../src/event-bus.js";
+import type { GatewayEvent } from "../src/types.js";
 
 const enabled = process.env.RUN_REAL_AGENT_TESTS === "1";
 
@@ -30,7 +32,13 @@ for (const engine of ["codeagent", "opencode", "deepseek-harness"] as const) {
           body: JSON.stringify({ content: "Reply with exactly: OK" }),
         });
         assert.equal(sent.status, 202);
-        const session = await waitForIdle(baseUrl, sessionId);
+        const terminal = await waitForTerminalEvent(created.service.events, sent.body.runId);
+        assert.equal(
+          terminal.type,
+          "generation.completed",
+          `Agent generation ended with ${terminal.type}: ${JSON.stringify(terminal.data)}`,
+        );
+        const session = (await json(baseUrl, `/v1/sessions/${sessionId}`)).body.session;
         assert.equal(session.status, "idle");
         assert.equal(session.messages.at(-1)?.role, "assistant");
         assert.match(session.messages.at(-1)?.content ?? "", /OK/i);
@@ -45,16 +53,30 @@ for (const engine of ["codeagent", "opencode", "deepseek-harness"] as const) {
   );
 }
 
-async function waitForIdle(baseUrl: string, sessionId: string): Promise<any> {
-  const deadline = Date.now() + 120_000;
-  while (Date.now() < deadline) {
-    const response = await json(baseUrl, `/v1/sessions/${sessionId}`);
-    if (response.body.session.status === "idle" && response.body.session.messages.length > 1) {
-      return response.body.session;
-    }
-    await new Promise((resolve) => setTimeout(resolve, 500));
-  }
-  throw new Error("Timed out waiting for real Agent response");
+async function waitForTerminalEvent(
+  events: EventBus,
+  runId: string,
+  timeoutMs = 120_000,
+): Promise<GatewayEvent> {
+  const isTerminal = (event: GatewayEvent) =>
+    event.runId === runId &&
+    (event.type === "generation.completed" ||
+      event.type === "generation.failed" ||
+      event.type === "generation.stopped");
+  const existing = events.eventsAfter(0).find(isTerminal);
+  if (existing) return existing;
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      unsubscribe();
+      reject(new Error("Timed out waiting for real Agent response"));
+    }, timeoutMs);
+    const unsubscribe = events.subscribe((event) => {
+      if (!isTerminal(event)) return;
+      clearTimeout(timer);
+      unsubscribe();
+      resolve(event);
+    });
+  });
 }
 
 async function json(baseUrl: string, pathname: string, init: RequestInit = {}): Promise<any> {
