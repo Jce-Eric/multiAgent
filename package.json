@@ -1,0 +1,27 @@
+{
+  "name": "multi-agent-gateway",
+  "version": "0.1.0",
+  "private": true,
+  "description": "A unified HTTP/SSE gateway for replaceable coding-agent engines.",
+  "type": "module",
+  "engines": {
+    "node": ">=18.17"
+  },
+  "scripts": {
+    "dev": "tsx watch src/cli.ts",
+    "start": "tsx src/cli.ts",
+    "build": "tsc -p tsconfig.json",
+    "start:prod": "node dist/src/cli.js",
+    "test": "tsx --test test/*.test.ts",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "express": "^5.2.1"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.3",
+    "@types/node": "^20.17.24",
+    "tsx": "^4.19.3",
+    "typescript": "^5.8.2"
+  }
+}
