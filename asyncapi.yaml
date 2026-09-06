@@ -1,0 +1,70 @@
+asyncapi: 3.0.0
+info:
+  title: Multi-Agent Gateway Events
+  version: 0.5.0
+  description: Canonical SSE events emitted by the multi-agent gateway.
+servers:
+  local:
+    host: 127.0.0.1:3000
+    protocol: http
+channels:
+  gatewayEvents:
+    address: /v1/events
+    description: Global event stream. Use sessionId to filter and Last-Event-ID to resume.
+    messages:
+      gatewayEvent:
+        $ref: "#/components/messages/GatewayEvent"
+operations:
+  receiveGatewayEvents:
+    action: receive
+    channel:
+      $ref: "#/channels/gatewayEvents"
+components:
+  messages:
+    GatewayEvent:
+      name: GatewayEvent
+      payload:
+        $ref: "#/components/schemas/GatewayEvent"
+  schemas:
+    GatewayEvent:
+      type: object
+      required: [id, specVersion, source, type, timestamp, data]
+      properties:
+        id:
+          type: integer
+          minimum: 1
+          description: Durable monotonically increasing event cursor when SQLite is configured.
+        specVersion:
+          type: string
+          const: "1.0"
+        source:
+          type: string
+          const: multi-agent-gateway
+        type:
+          type: string
+          enum:
+            - session.created
+            - session.deleted
+            - session.status.changed
+            - run.created
+            - run.status.changed
+            - message.user
+            - message.assistant.delta
+            - message.assistant.completed
+            - interaction.question
+            - interaction.permission
+            - interaction.resolved
+            - agent.event
+            - generation.started
+            - generation.completed
+            - generation.stopped
+            - generation.failed
+            - error
+        timestamp:
+          type: string
+          format: date-time
+        sessionId:
+          type: string
+        runId:
+          type: string
+        data: {}

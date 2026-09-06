@@ -1,6 +1,6 @@
 # Multi-Agent Gateway
 
-面向 coding agent 的统一 HTTP/SSE 网关。客户端只依赖 Session、Message、Interaction 和 Event API；服务启动时通过 `--engine` 或环境变量切换底层 Agent。
+面向 coding agent 的统一 HTTP/SSE 网关。客户端只依赖 Session、Message、Run、Interaction 和 Event API；`--engine` 选择默认 Agent，每个 Session 也可以选择其他已配置 Agent。
 
 ## 支持的引擎
 
@@ -43,6 +43,7 @@ GET    /health
 GET    /ready
 GET    /metrics
 GET    /openapi.yaml
+GET    /asyncapi.yaml
 GET    /v1/engines
 GET    /v1/events
 GET    /v1/sessions
@@ -52,9 +53,12 @@ DELETE /v1/sessions/:sessionId
 POST   /v1/sessions/:sessionId/messages
 POST   /v1/sessions/:sessionId/interactions/:requestId/respond
 POST   /v1/sessions/:sessionId/stop
+GET    /v1/sessions/:sessionId/runs
+GET    /v1/runs/:runId
 ```
 
 完整契约见 [openapi.yaml](openapi.yaml)。架构与扩展方式见 [docs/architecture.md](docs/architecture.md)。
+SSE 契约见 [asyncapi.yaml](asyncapi.yaml)，十轮架构审视和取舍见 [docs/architecture-exploration.md](docs/architecture-exploration.md)。
 
 创建项目会话：
 
@@ -64,7 +68,15 @@ curl -X POST http://127.0.0.1:3000/v1/sessions \
   -d '{"directory":"/absolute/project/path"}'
 ```
 
-发送消息后立即返回 `runId`：
+可选地为单个 Session 选择引擎；不传时继续使用 `--engine` 默认值：
+
+```bash
+curl -X POST http://127.0.0.1:3000/v1/sessions \
+  -H 'content-type: application/json' \
+  -d '{"directory":"/absolute/project/path","engine":"opencode"}'
+```
+
+发送消息后立即返回 `runId`，可通过 `/v1/runs/:runId` 查询规范化运行状态：
 
 ```bash
 curl -X POST http://127.0.0.1:3000/v1/sessions/SESSION_ID/messages \
@@ -79,7 +91,7 @@ curl -N http://127.0.0.1:3000/v1/events
 curl -N 'http://127.0.0.1:3000/v1/events?sessionId=SESSION_ID'
 ```
 
-支持 `Last-Event-ID` header 和 `lastEventId` query 回放内存中保留的事件。事件包含消息增量、反问、权限、原生 Agent 事件、完成、失败、终止和 Session 状态切换。
+支持 `Last-Event-ID` header 和 `lastEventId` query。内存模式回放当前进程保留的事件；SQLite 模式会持久化事件和递增 ID，因此重启后仍可继续回放。事件包含消息增量、Run 状态、反问、权限、原生 Agent 事件、完成、失败、终止和 Session 状态切换。
 
 反问响应：
 
@@ -108,13 +120,13 @@ curl -N 'http://127.0.0.1:3000/v1/events?sessionId=SESSION_ID'
 
 ## 持久化与恢复
 
-默认使用内存仓储。配置 SQLite 后，Session 和消息在服务重启后保留：
+默认使用内存仓储。配置 SQLite 后，Session、消息、Run 和 SSE 事件在服务重启后保留：
 
 ```bash
 GATEWAY_DATABASE_PATH=./data/gateway.db npm start -- --engine opencode
 ```
 
-SQLite 使用 WAL。重启时遗留的 `busy` Session 会恢复为 `idle`。原生 Agent 进程被空闲回收或服务重启后，下一次生成会创建新原生 Session，并用已保存消息做一次上下文回放。
+SQLite 使用 WAL。重启时遗留的 `busy` Session 会恢复为 `idle`，未完成 Run 会恢复为 `failed`。原生 Agent 进程被空闲回收或服务重启后，下一次生成会创建新原生 Session，并用已保存消息做一次上下文回放。
 
 ## 安全和资源策略
 
@@ -125,13 +137,13 @@ PERMISSION_POLICY=client \
 npm start -- --engine codeagent
 ```
 
-配置 API Key 后，`/v1` 和 `/metrics` 接受 `Authorization: Bearer ...` 或 `X-API-Key`。`/health`、`/ready` 和 `/openapi.yaml` 保持公开，便于探针和契约发现。
+配置 API Key 后，`/v1` 和 `/metrics` 接受 `Authorization: Bearer ...` 或 `X-API-Key`。`/health`、`/ready`、`/openapi.yaml` 和 `/asyncapi.yaml` 保持公开，便于探针和契约发现。
 
 `AGENT_ALLOWED_ROOTS` 使用平台路径分隔符连接多个根目录。网关对请求目录做 `realpath` 校验，可阻止父目录和符号链接逃逸。它提供项目边界校验，但不是操作系统沙箱；生产部署建议配合容器隔离。
 
 | 环境变量 | 默认值 | 说明 |
 | --- | --- | --- |
-| `MAX_SESSIONS` | `100` | 当前引擎最大逻辑 Session 数 |
+| `MAX_SESSIONS` | `100` | 网关最大逻辑 Session 数 |
 | `MAX_CONCURRENT_RUNS` | `10` | 全局同时生成数 |
 | `MAX_MESSAGES_PER_SESSION` | `200` | 单 Session 最大消息数 |
 | `GENERATION_TIMEOUT_MS` | `600000` | 单次生成超时，`0` 禁用 |

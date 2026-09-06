@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: Multi-Agent Gateway API
-  version: 0.4.0
+  version: 0.5.0
   description: Unified sessions, messages, interactions, cancellation, and SSE events for replaceable coding agents.
 servers:
   - url: http://127.0.0.1:3000
@@ -32,6 +32,18 @@ paths:
       responses:
         "200": { description: Gateway and repository are ready }
         "503": { description: Gateway is shutting down or repository is unavailable }
+  /openapi.yaml:
+    get:
+      security: []
+      summary: Get the HTTP API contract
+      responses:
+        "200": { description: OpenAPI document }
+  /asyncapi.yaml:
+    get:
+      security: []
+      summary: Get the SSE event contract
+      responses:
+        "200": { description: AsyncAPI document }
   /metrics:
     get:
       summary: Prometheus metrics
@@ -52,12 +64,15 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [gatewayVersion, active, capabilities, available]
+                required: [gatewayVersion, active, capabilities, available, engines]
                 properties:
                   gatewayVersion: { type: string }
                   active: { type: string }
                   available: { type: array, items: { type: string } }
                   capabilities: { $ref: "#/components/schemas/AgentCapabilities" }
+                  engines:
+                    type: array
+                    items: { $ref: "#/components/schemas/EngineDescriptor" }
         "401": { $ref: "#/components/responses/Unauthorized" }
   /v1/events:
     get:
@@ -80,7 +95,7 @@ paths:
         "401": { $ref: "#/components/responses/Unauthorized" }
   /v1/sessions:
     get:
-      summary: List sessions for the active engine
+      summary: List sessions across configured engines
       responses:
         "200":
           description: Session list
@@ -104,6 +119,9 @@ paths:
                 directory:
                   type: string
                   description: Existing project directory, restricted by AGENT_ALLOWED_ROOTS when configured.
+                engine:
+                  type: string
+                  description: Optional engine for this session. Defaults to the engine selected by --engine.
       responses:
         "201":
           description: Session created
@@ -196,6 +214,41 @@ paths:
               schema: { $ref: "#/components/schemas/RunAccepted" }
         "404": { $ref: "#/components/responses/Error" }
         "409": { $ref: "#/components/responses/Error" }
+  /v1/sessions/{sessionId}/runs:
+    parameters:
+      - $ref: "#/components/parameters/SessionId"
+    get:
+      summary: List runs for a session
+      responses:
+        "200":
+          description: Runs in reverse creation order
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [runs]
+                properties:
+                  runs: { type: array, items: { $ref: "#/components/schemas/Run" } }
+        "404": { $ref: "#/components/responses/Error" }
+  /v1/runs/{runId}:
+    parameters:
+      - in: path
+        name: runId
+        required: true
+        schema: { type: string }
+    get:
+      summary: Get a canonical run
+      responses:
+        "200":
+          description: Run snapshot
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [run]
+                properties:
+                  run: { $ref: "#/components/schemas/Run" }
+        "404": { $ref: "#/components/responses/Error" }
 components:
   securitySchemes:
     bearerAuth:
@@ -227,12 +280,43 @@ components:
       type: object
       required: [protocol, protocolVersion, nativeSessions, questions, permissions, cancellation]
       properties:
-        protocol: { type: string, enum: [reference, jsonl, acp, codex] }
+        protocol: { type: string }
         protocolVersion: { type: string }
         nativeSessions: { type: boolean }
         questions: { type: boolean }
         permissions: { type: boolean }
         cancellation: { type: boolean }
+    EngineDescriptor:
+      type: object
+      required: [name, displayName, capabilities]
+      properties:
+        name: { type: string }
+        displayName: { type: string }
+        capabilities: { $ref: "#/components/schemas/AgentCapabilities" }
+    ContentPart:
+      oneOf:
+        - type: object
+          required: [type, text]
+          properties:
+            type: { type: string, const: text }
+            text: { type: string }
+        - type: object
+          required: [type, value]
+          properties:
+            type: { type: string, const: json }
+            value: {}
+        - type: object
+          required: [type, name]
+          properties:
+            type: { type: string, const: file }
+            name: { type: string }
+            path: { type: string }
+            mimeType: { type: string }
+        - type: object
+          required: [type, artifactId]
+          properties:
+            type: { type: string, const: artifact }
+            artifactId: { type: string }
     Message:
       type: object
       required: [id, role, content, status, createdAt]
@@ -240,6 +324,7 @@ components:
         id: { type: string }
         role: { type: string, enum: [user, assistant] }
         content: { type: string }
+        parts: { type: array, items: { $ref: "#/components/schemas/ContentPart" } }
         status: { type: string, enum: [completed, stopped] }
         createdAt: { type: string, format: date-time }
     Session:
@@ -249,10 +334,38 @@ components:
         id: { type: string }
         engine: { type: string }
         directory: { type: string }
+        workspace:
+          type: object
+          required: [type, directory]
+          properties:
+            type: { type: string, const: local }
+            directory: { type: string }
         status: { type: string, enum: [idle, busy] }
         messages: { type: array, items: { $ref: "#/components/schemas/Message" } }
         createdAt: { type: string, format: date-time }
         updatedAt: { type: string, format: date-time }
+    Run:
+      type: object
+      required: [id, sessionId, engine, status, createdAt, updatedAt]
+      properties:
+        id: { type: string }
+        sessionId: { type: string }
+        engine: { type: string }
+        status:
+          type: string
+          enum: [queued, running, input_required, canceling, completed, failed, canceled]
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+        completedAt: { type: string, format: date-time }
+        outputMessageId: { type: string }
+        stopReason: { type: string }
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code: { type: string }
+            message: { type: string }
+            details: {}
     RunAccepted:
       type: object
       required: [runId]

@@ -7,11 +7,13 @@ import express, {
   type Response,
 } from "express";
 import { loadGatewayConfig, type GatewayConfig } from "./config.js";
-import { availableEngines, createEngine } from "./engines/registry.js";
+import { EngineCatalog } from "./engines/catalog.js";
 import { GatewayError } from "./errors.js";
 import { EventBus } from "./event-bus.js";
+import { createEventRepository, type EventRepository } from "./event-store.js";
 import { GatewayService } from "./gateway-service.js";
 import { GatewayMetrics } from "./metrics.js";
+import { createRunRepository, type RunRepository } from "./run-store.js";
 import { createSessionRepository, type SessionRepository } from "./session-store.js";
 import type { GatewayEvent, PermissionResponse, QuestionResponse } from "./types.js";
 import { GATEWAY_VERSION } from "./version.js";
@@ -22,6 +24,8 @@ export interface AppOptions {
   defaultDirectory?: string;
   config?: Partial<GatewayConfig>;
   repository?: SessionRepository;
+  runRepository?: RunRepository;
+  eventRepository?: EventRepository;
 }
 
 const asyncRoute =
@@ -51,10 +55,16 @@ export function createApp(options: AppOptions = {}) {
   const env = options.env ?? process.env;
   const config = { ...loadGatewayConfig(env), ...options.config };
   const engineName = options.engine ?? env.AGENT_ENGINE ?? "codeagent";
-  const events = new EventBus(config.eventHistoryLimit);
+  const engineCatalog = new EngineCatalog(engineName, env);
+  const eventRepository = options.eventRepository ?? createEventRepository(
+    config.databasePath,
+    config.eventHistoryLimit,
+  );
+  const events = new EventBus(config.eventHistoryLimit, eventRepository);
   const repository = options.repository ?? createSessionRepository(config.databasePath);
+  const runRepository = options.runRepository ?? createRunRepository(config.databasePath);
   const service = new GatewayService(
-    createEngine(engineName, env),
+    engineCatalog,
     events,
     options.defaultDirectory,
     {
@@ -66,6 +76,7 @@ export function createApp(options: AppOptions = {}) {
       maxSessions: config.maxSessions,
       permissionPolicy: config.permissionPolicy,
       repository,
+      runRepository,
     },
   );
   const metrics = new GatewayMetrics(service);
@@ -113,6 +124,10 @@ export function createApp(options: AppOptions = {}) {
     response.sendFile(path.resolve(process.cwd(), "openapi.yaml"));
   });
 
+  app.get("/asyncapi.yaml", (_request, response) => {
+    response.sendFile(path.resolve(process.cwd(), "asyncapi.yaml"));
+  });
+
   app.use((request, _response, next) => {
     if (!config.apiKey || !(request.path.startsWith("/v1") || request.path === "/metrics")) {
       next();
@@ -136,11 +151,13 @@ export function createApp(options: AppOptions = {}) {
   });
 
   app.get("/v1/engines", (_request, response) => {
+    const engines = service.listEngines();
     response.json({
       gatewayVersion: GATEWAY_VERSION,
       active: service.engine.name,
       capabilities: service.engine.capabilities,
-      available: availableEngines(env),
+      available: engines.map((engine) => engine.name),
+      engines,
     });
   });
 
@@ -180,10 +197,14 @@ export function createApp(options: AppOptions = {}) {
     "/v1/sessions",
     asyncRoute(async (request, response) => {
       const directory = request.body?.directory;
+      const engine = request.body?.engine;
       if (directory !== undefined && typeof directory !== "string") {
         throw new GatewayError(400, "VALIDATION_ERROR", "'directory' must be a string");
       }
-      const session = await service.createSession(directory);
+      if (engine !== undefined && typeof engine !== "string") {
+        throw new GatewayError(400, "VALIDATION_ERROR", "'engine' must be a string");
+      }
+      const session = await service.createSession(directory, engine);
       response.status(201).json({ session });
     }),
   );
@@ -224,6 +245,15 @@ export function createApp(options: AppOptions = {}) {
     const result = service.stopSession(routeParam(request.params.sessionId, "sessionId"));
     response.locals.runId = result.runId;
     response.status(202).json(result);
+  });
+
+  app.get("/v1/sessions/:sessionId/runs", (request, response) => {
+    const sessionId = routeParam(request.params.sessionId, "sessionId");
+    response.json({ runs: service.listRuns(sessionId) });
+  });
+
+  app.get("/v1/runs/:runId", (request, response) => {
+    response.json({ run: service.getRun(routeParam(request.params.runId, "runId")) });
   });
 
   app.use((_request, _response, next) => {

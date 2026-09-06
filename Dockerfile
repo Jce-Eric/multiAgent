@@ -12,5 +12,6 @@ COPY package.json package-lock.json ./
 RUN npm ci --omit=dev && npm cache clean --force
 COPY --from=build /app/dist ./dist
 COPY --from=build /app/openapi.yaml ./openapi.yaml
+COPY --from=build /app/asyncapi.yaml ./asyncapi.yaml
 EXPOSE 3000
 CMD ["node", "dist/src/cli.js"]

@@ -1,19 +1,27 @@
 import { randomUUID } from "node:crypto";
-import { promises as fs } from "node:fs";
-import path from "node:path";
 import type { PermissionPolicy } from "./config.js";
 import { EventBus } from "./event-bus.js";
 import { AbortGenerationError, GatewayError, isAbortError } from "./errors.js";
+import { MemoryRunRepository, type RunRepository } from "./run-store.js";
 import { MemorySessionRepository, type SessionRepository } from "./session-store.js";
 import type {
   InteractionType,
   Message,
   PermissionResponse,
   QuestionResponse,
+  Run,
+  RunError,
+  RunStatus,
   Session,
 } from "./types.js";
 import { deferred, now, type Deferred } from "./utils.js";
 import type { AgentEngine, PermissionInput, QuestionInput } from "./engines/types.js";
+import {
+  asEngineCatalog,
+  type EngineCatalogLike,
+  type EngineDescriptor,
+} from "./engines/catalog.js";
+import { WorkspaceResolver } from "./workspace.js";
 
 type InteractionResponse = QuestionResponse | PermissionResponse;
 type AbortReason = "user" | "timeout" | "shutdown";
@@ -25,7 +33,8 @@ interface PendingInteraction {
 }
 
 interface ActiveRun {
-  id: string;
+  record: Run;
+  engine: AgentEngine;
   controller: AbortController;
   interactions: Map<string, PendingInteraction>;
   finished: Deferred<void>;
@@ -42,29 +51,40 @@ export interface GatewayServiceOptions {
   maxSessions?: number;
   permissionPolicy?: PermissionPolicy;
   repository?: SessionRepository;
+  runRepository?: RunRepository;
+  workspaceResolver?: WorkspaceResolver;
 }
 
 export class GatewayService {
   readonly repository: SessionRepository;
+  readonly runs: RunRepository;
+  readonly engine: AgentEngine;
+  readonly engineCatalog: EngineCatalogLike;
   private readonly activeRuns = new Map<string, ActiveRun>();
   private readonly idleTimers = new Map<string, NodeJS.Timeout>();
-  private readonly allowedRoots: string[];
   private readonly generationTimeoutMs: number;
   private readonly idleSessionTimeoutMs: number;
   private readonly maxConcurrentRuns: number;
   private readonly maxMessagesPerSession: number;
   private readonly maxSessions: number;
   private readonly permissionPolicy: PermissionPolicy;
+  private readonly workspaceResolver: WorkspaceResolver;
   private shuttingDown = false;
 
   constructor(
-    readonly engine: AgentEngine,
+    engineOrCatalog: AgentEngine | EngineCatalogLike,
     readonly events = new EventBus(),
-    private readonly defaultDirectory = process.cwd(),
+    defaultDirectory = process.cwd(),
     options: GatewayServiceOptions = {},
   ) {
+    this.engineCatalog = asEngineCatalog(engineOrCatalog);
+    this.engine = this.engineCatalog.get(this.engineCatalog.defaultEngineName);
     this.repository = options.repository ?? new MemorySessionRepository();
-    this.allowedRoots = options.allowedRoots ?? [];
+    this.runs = options.runRepository ?? new MemoryRunRepository();
+    this.workspaceResolver = options.workspaceResolver ?? new WorkspaceResolver(
+      defaultDirectory,
+      options.allowedRoots ?? [],
+    );
     this.generationTimeoutMs = options.generationTimeoutMs ?? 10 * 60_000;
     this.idleSessionTimeoutMs = options.idleSessionTimeoutMs ?? 5 * 60_000;
     this.maxConcurrentRuns = options.maxConcurrentRuns ?? 10;
@@ -72,7 +92,7 @@ export class GatewayService {
     this.maxSessions = options.maxSessions ?? 100;
     this.permissionPolicy = options.permissionPolicy ?? "client";
 
-    for (const session of this.ownSessions()) {
+    for (const session of this.repository.list()) {
       if (session.status !== "idle") {
         session.status = "idle";
         session.updatedAt = now();
@@ -82,23 +102,25 @@ export class GatewayService {
     }
   }
 
-  async createSession(directory?: string): Promise<Session> {
+  async createSession(directory?: string, engineName = this.engine.name): Promise<Session> {
     this.ensureAvailable();
-    if (this.ownSessions().length >= this.maxSessions) {
+    if (this.repository.list().length >= this.maxSessions) {
       throw new GatewayError(429, "RESOURCE_LIMIT", `Session limit of ${this.maxSessions} reached`);
     }
-    const resolvedDirectory = await this.resolveDirectory(directory);
+    const engine = this.engineCatalog.get(engineName);
+    const resolved = await this.workspaceResolver.resolve(directory);
     const timestamp = now();
     const session: Session = {
       id: randomUUID(),
-      engine: this.engine.name,
-      directory: resolvedDirectory,
+      engine: engine.name,
+      directory: resolved.directory,
+      workspace: resolved.workspace,
       status: "idle",
       messages: [],
       createdAt: timestamp,
       updatedAt: timestamp,
     };
-    await this.engine.openSession?.({
+    await engine.openSession?.({
       sessionId: session.id,
       directory: session.directory,
       messages: [],
@@ -106,7 +128,7 @@ export class GatewayService {
     try {
       this.repository.add(session);
     } catch (error) {
-      await Promise.resolve(this.engine.closeSession?.(session.id)).catch(() => undefined);
+      await Promise.resolve(engine.closeSession?.(session.id)).catch(() => undefined);
       throw error;
     }
     this.events.publish("session.created", this.snapshot(session), { sessionId: session.id });
@@ -115,29 +137,44 @@ export class GatewayService {
   }
 
   listSessions(): Session[] {
-    return this.ownSessions().map((session) => this.snapshot(session));
+    return this.repository.list().map((session) => this.snapshot(session));
   }
 
   getSession(id: string): Session {
-    return this.snapshot(this.getOwnSession(id));
+    return this.snapshot(this.repository.get(id));
+  }
+
+  getRun(id: string): Run {
+    return this.snapshotRun(this.runs.get(id));
+  }
+
+  listRuns(sessionId: string): Run[] {
+    this.repository.get(sessionId);
+    return this.runs.listForSession(sessionId).map((run) => this.snapshotRun(run));
+  }
+
+  listEngines(): EngineDescriptor[] {
+    return this.engineCatalog.descriptors();
   }
 
   async deleteSession(id: string): Promise<void> {
-    const session = this.getOwnSession(id);
+    const session = this.repository.get(id);
     const run = this.activeRuns.get(id);
     if (run) {
+      this.setRunStatus(run.record, "canceling");
       this.abortRun(run, "user");
       await run.finished.promise;
     }
     this.clearIdleTimer(id);
-    await this.engine.closeSession?.(id);
+    await this.engineCatalog.find(session.engine)?.closeSession?.(id);
     this.repository.delete(id);
     this.events.publish("session.deleted", { id: session.id }, { sessionId: session.id });
   }
 
   sendMessage(sessionId: string, content: string): { runId: string } {
     this.ensureAvailable();
-    const session = this.getOwnSession(sessionId);
+    const session = this.repository.get(sessionId);
+    const engine = this.engineCatalog.get(session.engine);
     if (session.status === "busy") {
       throw new GatewayError(409, "SESSION_BUSY", `Session '${sessionId}' is already busy`);
     }
@@ -161,8 +198,19 @@ export class GatewayService {
     session.messages.push(userMessage);
     session.updatedAt = now();
     this.repository.save(session);
-    const run: ActiveRun = {
+    const timestamp = now();
+    const record: Run = {
       id: randomUUID(),
+      sessionId,
+      engine: engine.name,
+      status: "running",
+      createdAt: timestamp,
+      updatedAt: timestamp,
+    };
+    this.runs.add(record);
+    const run: ActiveRun = {
+      record,
+      engine,
       controller: new AbortController(),
       interactions: new Map(),
       finished: deferred<void>(),
@@ -172,15 +220,16 @@ export class GatewayService {
       run.timeout.unref();
     }
     this.activeRuns.set(sessionId, run);
-    this.setStatus(session, "busy", run.id);
-    this.events.publish("message.user", userMessage, { sessionId, runId: run.id });
+    this.setStatus(session, "busy", record.id);
+    this.events.publish("message.user", userMessage, { sessionId, runId: record.id });
+    this.events.publish("run.created", this.snapshotRun(record), { sessionId, runId: record.id });
     this.events.publish(
       "generation.started",
-      { engine: this.engine.name, directory: session.directory },
-      { sessionId, runId: run.id },
+      { engine: engine.name, directory: session.directory },
+      { sessionId, runId: record.id },
     );
     void this.executeRun(session, run, content);
-    return { runId: run.id };
+    return { runId: record.id };
   }
 
   respondToInteraction(
@@ -188,7 +237,7 @@ export class GatewayService {
     requestId: string,
     response: InteractionResponse,
   ): void {
-    this.getOwnSession(sessionId);
+    this.repository.get(sessionId);
     const run = this.activeRuns.get(sessionId);
     const interaction = run?.interactions.get(requestId);
     if (!run || !interaction) {
@@ -204,28 +253,32 @@ export class GatewayService {
     this.events.publish(
       "interaction.resolved",
       { requestId, interactionType: interaction.type, response },
-      { sessionId, runId: run.id },
+      { sessionId, runId: run.record.id },
     );
+    if (run.interactions.size === 0 && !run.controller.signal.aborted) {
+      this.setRunStatus(run.record, "running");
+    }
   }
 
   stopSession(sessionId: string): { runId: string } {
-    const session = this.getOwnSession(sessionId);
+    const session = this.repository.get(sessionId);
     const run = this.activeRuns.get(sessionId);
     if (!run || session.status !== "busy") {
       throw new GatewayError(409, "SESSION_IDLE", `Session '${sessionId}' is not generating`);
     }
+    this.setRunStatus(run.record, "canceling");
     this.abortRun(run, "user");
-    return { runId: run.id };
+    return { runId: run.record.id };
   }
 
   isReady(): boolean {
-    return !this.shuttingDown && this.repository.health();
+    return !this.shuttingDown && this.repository.health() && this.runs.health() && this.events.health();
   }
 
   stats(): { activeRuns: number; sessions: number; shuttingDown: boolean } {
     return {
       activeRuns: this.activeRuns.size,
-      sessions: this.ownSessions().length,
+      sessions: this.repository.list().length,
       shuttingDown: this.shuttingDown,
     };
   }
@@ -235,20 +288,27 @@ export class GatewayService {
     this.shuttingDown = true;
     for (const timer of this.idleTimers.values()) clearTimeout(timer);
     this.idleTimers.clear();
-    for (const run of this.activeRuns.values()) this.abortRun(run, "shutdown");
+    for (const run of this.activeRuns.values()) {
+      this.setRunStatus(run.record, "canceling");
+      this.abortRun(run, "shutdown");
+    }
     await Promise.allSettled([...this.activeRuns.values()].map((run) => run.finished.promise));
     await Promise.allSettled(
-      this.ownSessions().map((session) => this.engine.closeSession?.(session.id)),
+      this.repository.list().map((session) =>
+        this.engineCatalog.find(session.engine)?.closeSession?.(session.id),
+      ),
     );
     this.repository.close();
+    this.runs.close();
+    this.events.close();
   }
 
   private async executeRun(session: Session, run: ActiveRun, prompt: string): Promise<void> {
     let accumulated = "";
     try {
-      const result = await this.engine.generate(prompt, {
+      const result = await run.engine.generate(prompt, {
         sessionId: session.id,
-        runId: run.id,
+        runId: run.record.id,
         directory: session.directory,
         messages: session.messages,
         signal: run.controller.signal,
@@ -257,7 +317,7 @@ export class GatewayService {
           accumulated += text;
           this.events.publish("message.assistant.delta", { delta: text }, {
             sessionId: session.id,
-            runId: run.id,
+            runId: run.record.id,
           });
         },
         askQuestion: (input) => this.createQuestion(session, run, input),
@@ -266,7 +326,7 @@ export class GatewayService {
           if (run.controller.signal.aborted) return;
           this.events.publish("agent.event", { type, data }, {
             sessionId: session.id,
-            runId: run.id,
+            runId: run.record.id,
           });
         },
       });
@@ -275,7 +335,7 @@ export class GatewayService {
         accumulated = result;
         this.events.publish("message.assistant.delta", { delta: result }, {
           sessionId: session.id,
-          runId: run.id,
+          runId: run.record.id,
         });
       }
       const message = this.createMessage("assistant", accumulated, "completed");
@@ -284,11 +344,13 @@ export class GatewayService {
       this.repository.save(session);
       this.events.publish("message.assistant.completed", message, {
         sessionId: session.id,
-        runId: run.id,
+        runId: run.record.id,
       });
+      run.record.outputMessageId = message.id;
+      this.setRunStatus(run.record, "completed");
       this.events.publish("generation.completed", { messageId: message.id }, {
         sessionId: session.id,
-        runId: run.id,
+        runId: run.record.id,
       });
     } catch (error) {
       if (run.abortReason === "timeout") {
@@ -304,13 +366,15 @@ export class GatewayService {
           this.repository.save(session);
           this.events.publish("message.assistant.completed", message, {
             sessionId: session.id,
-            runId: run.id,
+            runId: run.record.id,
           });
+          run.record.outputMessageId = message.id;
         }
-        this.events.publish("error", normalized, { sessionId: session.id, runId: run.id });
+        this.setRunStatus(run.record, "failed", { error: normalized });
+        this.events.publish("error", normalized, { sessionId: session.id, runId: run.record.id });
         this.events.publish("generation.failed", normalized, {
           sessionId: session.id,
-          runId: run.id,
+          runId: run.record.id,
         });
       } else if (isAbortError(error) || run.controller.signal.aborted) {
         if (accumulated) {
@@ -320,20 +384,25 @@ export class GatewayService {
           this.repository.save(session);
           this.events.publish("message.assistant.completed", message, {
             sessionId: session.id,
-            runId: run.id,
+            runId: run.record.id,
           });
+          run.record.outputMessageId = message.id;
         }
+        this.setRunStatus(run.record, "canceled", {
+          stopReason: run.abortReason ?? "user",
+        });
         this.events.publish(
           "generation.stopped",
           { partialContent: accumulated, reason: run.abortReason ?? "user" },
-          { sessionId: session.id, runId: run.id },
+          { sessionId: session.id, runId: run.record.id },
         );
       } else {
         const normalized = this.normalizeEngineError(error);
-        this.events.publish("error", normalized, { sessionId: session.id, runId: run.id });
+        this.setRunStatus(run.record, "failed", { error: normalized });
+        this.events.publish("error", normalized, { sessionId: session.id, runId: run.record.id });
         this.events.publish("generation.failed", normalized, {
           sessionId: session.id,
-          runId: run.id,
+          runId: run.record.id,
         });
       }
     } finally {
@@ -342,8 +411,10 @@ export class GatewayService {
         interaction.value.reject(new AbortGenerationError());
       }
       run.interactions.clear();
-      if (this.activeRuns.get(session.id)?.id === run.id) this.activeRuns.delete(session.id);
-      this.setStatus(session, "idle", run.id);
+      if (this.activeRuns.get(session.id)?.record.id === run.record.id) {
+        this.activeRuns.delete(session.id);
+      }
+      this.setStatus(session, "idle", run.record.id);
       this.scheduleIdleClose(session.id);
       run.finished.resolve();
     }
@@ -355,6 +426,7 @@ export class GatewayService {
     input: QuestionInput,
   ): Promise<QuestionResponse> {
     const interaction = this.registerInteraction(run, "question");
+    this.setRunStatus(run.record, "input_required");
     this.events.publish(
       "interaction.question",
       {
@@ -364,7 +436,7 @@ export class GatewayService {
         schema: input.schema,
         metadata: input.metadata,
       },
-      { sessionId: session.id, runId: run.id },
+      { sessionId: session.id, runId: run.record.id },
     );
     return interaction.value.promise as Promise<QuestionResponse>;
   }
@@ -375,6 +447,7 @@ export class GatewayService {
     input: PermissionInput,
   ): Promise<PermissionResponse> {
     const interaction = this.registerInteraction(run, "permission");
+    this.setRunStatus(run.record, "input_required");
     this.events.publish(
       "interaction.permission",
       {
@@ -384,7 +457,7 @@ export class GatewayService {
         options: input.options,
         metadata: input.metadata,
       },
-      { sessionId: session.id, runId: run.id },
+      { sessionId: session.id, runId: run.record.id },
     );
     if (this.permissionPolicy !== "client") {
       const response: PermissionResponse = { decision: this.permissionPolicy };
@@ -398,8 +471,9 @@ export class GatewayService {
           response,
           resolvedBy: "policy",
         },
-        { sessionId: session.id, runId: run.id },
+        { sessionId: session.id, runId: run.record.id },
       );
+      this.setRunStatus(run.record, "running");
     }
     return interaction.value.promise as Promise<PermissionResponse>;
   }
@@ -470,32 +544,26 @@ export class GatewayService {
     });
   }
 
-  private async resolveDirectory(directory?: string): Promise<string> {
-    const requested = path.resolve(directory ?? this.defaultDirectory);
-    let resolved: string;
-    try {
-      resolved = await fs.realpath(requested);
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-        throw new GatewayError(400, "DIRECTORY_NOT_FOUND", `Directory '${requested}' does not exist`);
-      }
-      throw error;
+  private setRunStatus(
+    run: Run,
+    status: RunStatus,
+    update: { error?: RunError; stopReason?: string } = {},
+  ): void {
+    if (run.status === status && update.error === undefined && update.stopReason === undefined) return;
+    const previous = run.status;
+    run.status = status;
+    run.updatedAt = now();
+    if (update.error !== undefined) run.error = update.error;
+    if (update.stopReason !== undefined) run.stopReason = update.stopReason;
+    if (status === "completed" || status === "failed" || status === "canceled") {
+      run.completedAt = run.updatedAt;
     }
-    const stat = await fs.stat(resolved);
-    if (!stat.isDirectory()) {
-      throw new GatewayError(400, "DIRECTORY_INVALID", `Path '${resolved}' is not a directory`);
-    }
-    if (this.allowedRoots.length) {
-      const roots = await Promise.all(this.allowedRoots.map((root) => fs.realpath(path.resolve(root))));
-      if (!roots.some((root) => isWithin(root, resolved))) {
-        throw new GatewayError(
-          403,
-          "DIRECTORY_NOT_ALLOWED",
-          `Directory '${resolved}' is outside the configured allowed roots`,
-        );
-      }
-    }
-    return resolved;
+    this.runs.save(run);
+    this.events.publish(
+      "run.status.changed",
+      { previous, status, run: this.snapshotRun(run) },
+      { sessionId: run.sessionId, runId: run.id },
+    );
   }
 
   private scheduleIdleClose(sessionId: string): void {
@@ -504,7 +572,13 @@ export class GatewayService {
     const timer = setTimeout(() => {
       this.idleTimers.delete(sessionId);
       if (this.activeRuns.has(sessionId)) return;
-      void Promise.resolve(this.engine.closeSession?.(sessionId)).then(() => {
+      let session: Session;
+      try {
+        session = this.repository.get(sessionId);
+      } catch {
+        return;
+      }
+      void Promise.resolve(this.engineCatalog.find(session.engine)?.closeSession?.(sessionId)).then(() => {
         this.events.publish(
           "agent.event",
           { type: "gateway.runtime.closed", data: { reason: "idle_timeout" } },
@@ -522,18 +596,6 @@ export class GatewayService {
     this.idleTimers.delete(sessionId);
   }
 
-  private ownSessions(): Session[] {
-    return this.repository.list().filter((session) => session.engine === this.engine.name);
-  }
-
-  private getOwnSession(id: string): Session {
-    const session = this.repository.get(id);
-    if (session.engine !== this.engine.name) {
-      throw new GatewayError(404, "SESSION_NOT_FOUND", `Session '${id}' was not found`);
-    }
-    return session;
-  }
-
   private ensureAvailable(): void {
     if (this.shuttingDown) {
       throw new GatewayError(503, "SERVICE_UNAVAILABLE", "Gateway is shutting down");
@@ -545,11 +607,34 @@ export class GatewayService {
     content: string,
     status: Message["status"],
   ): Message {
-    return { id: randomUUID(), role, content, status, createdAt: now() };
+    return {
+      id: randomUUID(),
+      role,
+      content,
+      parts: [{ type: "text", text: content }],
+      status,
+      createdAt: now(),
+    };
   }
 
   private snapshot(session: Session): Session {
-    return { ...session, messages: session.messages.map((message) => ({ ...message })) };
+    return {
+      ...session,
+      workspace: session.workspace ?? { type: "local", directory: session.directory },
+      messages: session.messages.map((message) => ({
+        ...message,
+        parts: message.parts
+          ? message.parts.map((part) => ({ ...part }))
+          : [{ type: "text", text: message.content }],
+      })),
+    };
+  }
+
+  private snapshotRun(run: Run): Run {
+    return {
+      ...run,
+      ...(run.error ? { error: { ...run.error } } : {}),
+    };
   }
 
   private normalizeEngineError(error: unknown): { code: string; message: string; details?: unknown } {
@@ -561,9 +646,4 @@ export class GatewayService {
       message: error instanceof Error ? error.message : "Unknown engine error",
     };
   }
-}
-
-function isWithin(root: string, target: string): boolean {
-  const relative = path.relative(root, target);
-  return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
 }

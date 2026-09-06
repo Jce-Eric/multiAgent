@@ -1,32 +1,30 @@
 import type { GatewayEvent, GatewayEventType } from "./types.js";
+import { MemoryEventRepository, type EventRepository } from "./event-store.js";
 import { now } from "./utils.js";
 
 export type EventListener = (event: GatewayEvent) => void;
 
 export class EventBus {
-  private sequence = 0;
-  private readonly history: GatewayEvent[] = [];
   private readonly listeners = new Set<EventListener>();
 
-  constructor(private readonly historyLimit = 1_000) {}
+  constructor(
+    historyLimit = 1_000,
+    private readonly repository: EventRepository = new MemoryEventRepository(historyLimit),
+  ) {}
 
   publish(
     type: GatewayEventType,
     data: unknown,
     context: { sessionId?: string; runId?: string } = {},
   ): GatewayEvent {
-    const event: GatewayEvent = {
-      id: ++this.sequence,
+    const event = this.repository.append({
+      specVersion: "1.0",
+      source: "multi-agent-gateway",
       type,
       timestamp: now(),
       ...context,
       data,
-    };
-
-    this.history.push(event);
-    if (this.history.length > this.historyLimit) {
-      this.history.shift();
-    }
+    });
 
     for (const listener of this.listeners) {
       listener(event);
@@ -40,8 +38,14 @@ export class EventBus {
   }
 
   eventsAfter(lastEventId: number, sessionId?: string): GatewayEvent[] {
-    return this.history.filter(
-      (event) => event.id > lastEventId && (!sessionId || event.sessionId === sessionId),
-    );
+    return this.repository.eventsAfter(lastEventId, sessionId);
+  }
+
+  health(): boolean {
+    return this.repository.health();
+  }
+
+  close(): void {
+    this.repository.close();
   }
 }

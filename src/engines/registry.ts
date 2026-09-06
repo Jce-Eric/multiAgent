@@ -8,7 +8,7 @@ import type { AgentEngine } from "./types.js";
 import { ProcessBridgeEngine } from "./process-bridge-engine.js";
 import { ReferenceEngine } from "./reference-engine.js";
 
-export type EngineProtocol = "reference" | "jsonl" | "acp" | "codex";
+export type EngineProtocol = string;
 
 export interface EngineDefinition {
   protocol: EngineProtocol;
@@ -21,6 +21,22 @@ interface EngineConfigFile {
 }
 
 const require = createRequire(import.meta.url);
+
+export type EngineFactory = (
+  name: string,
+  definition: EngineDefinition,
+  env: NodeJS.ProcessEnv,
+) => AgentEngine;
+
+const protocolFactories = new Map<string, EngineFactory>([
+  ["reference", (name, definition) =>
+    new ReferenceEngine(name, definition.displayName ?? name)],
+  ["acp", (name, definition, env) => new AcpEngine(name, definition.command!, env)],
+  ["codex", (name, definition, env) =>
+    new CodexAppServerEngine(name, definition.command!, env)],
+  ["jsonl", (name, definition, env) =>
+    new ProcessBridgeEngine(name, definition.command!, env)],
+]);
 
 const BUILTIN_ENGINES = {
   codeagent: {
@@ -61,12 +77,12 @@ const BUILTIN_ENGINES = {
 export type EngineName = string;
 
 export function availableEngines(env: NodeJS.ProcessEnv = process.env): EngineName[] {
-  return Object.keys(loadDefinitions(env));
+  return Object.keys(loadEngineDefinitions(env));
 }
 
 export function createEngine(name: string, env: NodeJS.ProcessEnv = process.env): AgentEngine {
   const normalized = name.toLowerCase();
-  const definitions = loadDefinitions(env);
+  const definitions = loadEngineDefinitions(env);
   const definition = definitions[normalized];
   if (!definition) {
     throw new GatewayError(400, "ENGINE_NOT_FOUND", `Unknown engine '${name}'`, {
@@ -74,26 +90,41 @@ export function createEngine(name: string, env: NodeJS.ProcessEnv = process.env)
     });
   }
 
-  if (definition.protocol === "reference") {
-    return new ReferenceEngine(normalized, definition.displayName ?? normalized);
-  }
-  if (!definition.command?.trim()) {
+  return createEngineFromDefinition(normalized, definition, env);
+}
+
+export function createEngineFromDefinition(
+  name: string,
+  definition: EngineDefinition,
+  env: NodeJS.ProcessEnv = process.env,
+): AgentEngine {
+  const factory = protocolFactories.get(definition.protocol);
+  if (!factory) {
     throw new GatewayError(
       400,
       "ENGINE_CONFIG_INVALID",
-      `Engine '${normalized}' requires a command for protocol '${definition.protocol}'`,
+      `Engine '${name}' uses unregistered protocol '${definition.protocol}'`,
     );
   }
-  if (definition.protocol === "acp") {
-    return new AcpEngine(normalized, definition.command, env);
+  if (definition.protocol !== "reference" && !definition.command?.trim()) {
+    throw new GatewayError(
+      400,
+      "ENGINE_CONFIG_INVALID",
+      `Engine '${name}' requires a command for protocol '${definition.protocol}'`,
+    );
   }
-  if (definition.protocol === "codex") {
-    return new CodexAppServerEngine(normalized, definition.command, env);
-  }
-  return new ProcessBridgeEngine(normalized, definition.command, env);
+  return factory(name, definition, env);
 }
 
-function loadDefinitions(env: NodeJS.ProcessEnv): Record<string, EngineDefinition> {
+export function registerEngineProtocol(protocol: string, factory: EngineFactory): void {
+  const normalized = protocol.trim().toLowerCase();
+  if (!normalized) {
+    throw new GatewayError(400, "ENGINE_CONFIG_INVALID", "Engine protocol name cannot be empty");
+  }
+  protocolFactories.set(normalized, factory);
+}
+
+export function loadEngineDefinitions(env: NodeJS.ProcessEnv): Record<string, EngineDefinition> {
   const definitions: Record<string, EngineDefinition> = {};
   for (const [name, builtin] of Object.entries(BUILTIN_ENGINES)) {
     const configuredCommand = env[`${builtin.prefix}_COMMAND`]?.trim();
@@ -147,8 +178,9 @@ function loadDefinitions(env: NodeJS.ProcessEnv): Record<string, EngineDefinitio
 }
 
 function normalizeProtocol(value: unknown, engineName: string): EngineProtocol {
-  if (value === "reference" || value === "jsonl" || value === "acp" || value === "codex") {
-    return value;
+  if (typeof value === "string" && value.trim()) {
+    const protocol = value.trim().toLowerCase();
+    if (protocolFactories.has(protocol)) return protocol;
   }
   throw new GatewayError(
     400,

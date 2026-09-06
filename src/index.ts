@@ -7,11 +7,46 @@ export {
   createSessionRepository,
   type SessionRepository,
 } from "./session-store.js";
-export { createEngine, availableEngines, type EngineName } from "./engines/registry.js";
+export {
+  MemoryRunRepository,
+  SqliteRunRepository,
+  createRunRepository,
+  type RunRepository,
+} from "./run-store.js";
+export {
+  MemoryEventRepository,
+  SqliteEventRepository,
+  createEventRepository,
+  type EventRepository,
+} from "./event-store.js";
+export {
+  EngineCatalog,
+  type EngineCatalogLike,
+  type EngineDescriptor,
+} from "./engines/catalog.js";
+export {
+  createEngine,
+  availableEngines,
+  registerEngineProtocol,
+  type EngineDefinition,
+  type EngineName,
+  type EngineProtocol,
+  type EngineFactory,
+} from "./engines/registry.js";
 export type {
   AgentCapabilities,
   AgentEngine,
   AgentRunContext,
   AgentSessionContext,
 } from "./engines/types.js";
-export type { GatewayEvent, GatewayEventType, Message, Session } from "./types.js";
+export type {
+  ContentPart,
+  GatewayEvent,
+  GatewayEventType,
+  Message,
+  Run,
+  RunStatus,
+  Session,
+  WorkspaceRef,
+} from "./types.js";
+export { WorkspaceResolver } from "./workspace.js";

@@ -6,6 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { createApp } from "../src/app.js";
+import { SqliteRunRepository } from "../src/run-store.js";
 import { SqliteSessionRepository } from "../src/session-store.js";
 import type { EventBus } from "../src/event-bus.js";
 import type { GatewayEvent, GatewayEventType, Session } from "../src/types.js";
@@ -60,6 +61,62 @@ test("SQLite persists sessions and recovers busy state as idle", async () => {
   }
 });
 
+test("SQLite persists runs and replayable gateway events across restarts", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "gateway-durable-events-"));
+  const databasePath = path.join(root, "gateway.db");
+  const env = { ...referenceEnv, GATEWAY_DATABASE_PATH: databasePath };
+  try {
+    const first = createApp({ engine: "codeagent", env });
+    const session = await first.service.createSession(root);
+    const accepted = first.service.sendMessage(session.id, "durable run");
+    const completed = await waitForEvent(
+      first.service.events,
+      "generation.completed",
+      (event) => event.runId === accepted.runId,
+    );
+    const originalRun = first.service.getRun(accepted.runId);
+    assert.equal(originalRun.status, "completed");
+    await first.service.shutdown();
+
+    const second = createApp({ engine: "opencode", env });
+    const restored = second.service.getRun(accepted.runId);
+    assert.equal(restored.status, "completed");
+    assert.equal(restored.engine, "codeagent");
+    assert(second.service.events.eventsAfter(0).some((event) => event.id === completed.id));
+    const resumed = second.service.sendMessage(session.id, "route restored session");
+    await waitForEvent(
+      second.service.events,
+      "generation.completed",
+      (event) => event.runId === resumed.runId,
+    );
+    assert.equal(second.service.getRun(resumed.runId).engine, "codeagent");
+    const next = await second.service.createSession(root, "opencode");
+    const nextEvent = second.service.events.eventsAfter(completed.id).find(
+      (event) => event.sessionId === next.id && event.type === "session.created",
+    );
+    assert(nextEvent && nextEvent.id > completed.id);
+    await second.service.shutdown();
+
+    const interrupted = new SqliteRunRepository(databasePath);
+    const timestamp = new Date().toISOString();
+    interrupted.add({
+      id: "interrupted-run",
+      sessionId: "missing-session",
+      engine: "codeagent",
+      status: "running",
+      createdAt: timestamp,
+      updatedAt: timestamp,
+    });
+    interrupted.close();
+    const recovered = new SqliteRunRepository(databasePath);
+    assert.equal(recovered.get("interrupted-run").status, "failed");
+    assert.equal(recovered.get("interrupted-run").error?.code, "GATEWAY_RESTARTED");
+    recovered.close();
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
 test("allowed roots reject direct and symlink directory escapes", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "gateway-roots-"));
   const allowed = path.join(root, "allowed");
@@ -98,6 +155,7 @@ test("API key protects v1 and metrics while health and readiness remain public",
     assert.equal((await fetch(`${baseUrl}/health`)).status, 200);
     assert.equal((await fetch(`${baseUrl}/ready`)).status, 200);
     assert.equal((await fetch(`${baseUrl}/openapi.yaml`)).status, 200);
+    assert.equal((await fetch(`${baseUrl}/asyncapi.yaml`)).status, 200);
     const denied = await fetch(`${baseUrl}/v1/engines`);
     assert.equal(denied.status, 401);
     assert.equal((await denied.json() as any).error.code, "UNAUTHORIZED");

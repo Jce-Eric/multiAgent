@@ -7,6 +7,9 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { createApp } from "../src/app.js";
+import { ReferenceEngine } from "../src/engines/reference-engine.js";
+import { registerEngineProtocol } from "../src/engines/registry.js";
+import type { EventBus } from "../src/event-bus.js";
 import type { GatewayEvent, GatewayEventType, Session } from "../src/types.js";
 
 interface TestServer {
@@ -49,6 +52,30 @@ async function requestJson(
   });
   const text = await response.text();
   return { status: response.status, body: text ? JSON.parse(text) : undefined };
+}
+
+async function waitForServiceEvent(
+  events: EventBus,
+  type: GatewayEventType,
+  predicate: (event: GatewayEvent) => boolean,
+  timeout = 3_000,
+): Promise<GatewayEvent> {
+  const existing = events.eventsAfter(0).find(
+    (event) => event.type === type && predicate(event),
+  );
+  if (existing) return existing;
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      unsubscribe();
+      reject(new Error(`Timed out waiting for ${type}`));
+    }, timeout);
+    const unsubscribe = events.subscribe((event) => {
+      if (event.type !== type || !predicate(event)) return;
+      clearTimeout(timer);
+      unsubscribe();
+      resolve(event);
+    });
+  });
 }
 
 class SseClient {
@@ -262,6 +289,8 @@ test("question, permission, failure, and every SSE domain event type", async () 
       "session.created",
       "session.deleted",
       "session.status.changed",
+      "run.created",
+      "run.status.changed",
       "message.user",
       "message.assistant.delta",
       "message.assistant.completed",
@@ -313,6 +342,141 @@ test("codeagent and opencode are distinct engines", async () => {
   }
 });
 
+test("one gateway routes sessions to multiple engines and exposes canonical runs", async () => {
+  const created = createApp({
+    engine: "codeagent",
+    env: {
+      ...process.env,
+      CODEAGENT_PROTOCOL: "reference",
+      OPENCODE_PROTOCOL: "reference",
+      LOG_LEVEL: "silent",
+    },
+  });
+  const server = createServer(created.app);
+  server.listen(0, "127.0.0.1");
+  await once(server, "listening");
+  const address = server.address();
+  assert(address && typeof address === "object");
+  const baseUrl = `http://127.0.0.1:${address.port}`;
+  const sse = new SseClient();
+  try {
+    await sse.connect(`${baseUrl}/v1/events`);
+    const codeSession = await requestJson(baseUrl, "/v1/sessions", {
+      method: "POST",
+      body: JSON.stringify({ engine: "codeagent" }),
+    });
+    const openSession = await requestJson(baseUrl, "/v1/sessions", {
+      method: "POST",
+      body: JSON.stringify({ engine: "opencode" }),
+    });
+    assert.equal(codeSession.body.session.engine, "codeagent");
+    assert.equal(openSession.body.session.engine, "opencode");
+    assert.equal(codeSession.body.session.workspace.type, "local");
+    const unknownEngine = await requestJson(baseUrl, "/v1/sessions", {
+      method: "POST",
+      body: JSON.stringify({ engine: "missing-engine" }),
+    });
+    assert.equal(unknownEngine.status, 400);
+    assert.equal(unknownEngine.body.error.code, "ENGINE_NOT_FOUND");
+
+    const codeRun = await requestJson(
+      baseUrl,
+      `/v1/sessions/${codeSession.body.session.id}/messages`,
+      { method: "POST", body: JSON.stringify({ content: "from code" }) },
+    );
+    const openRun = await requestJson(
+      baseUrl,
+      `/v1/sessions/${openSession.body.session.id}/messages`,
+      { method: "POST", body: JSON.stringify({ content: "from open" }) },
+    );
+    await Promise.all([
+      sse.waitFor("generation.completed", (event) => event.runId === codeRun.body.runId),
+      sse.waitFor("generation.completed", (event) => event.runId === openRun.body.runId),
+    ]);
+
+    const run = await requestJson(baseUrl, `/v1/runs/${openRun.body.runId}`);
+    assert.equal(run.body.run.status, "completed");
+    assert.equal(run.body.run.engine, "opencode");
+    const runs = await requestJson(
+      baseUrl,
+      `/v1/sessions/${openSession.body.session.id}/runs`,
+    );
+    assert.equal(runs.body.runs.length, 1);
+    const session = await requestJson(baseUrl, `/v1/sessions/${openSession.body.session.id}`);
+    assert.equal(session.body.session.messages.at(-1).parts[0].type, "text");
+
+    const engines = await requestJson(baseUrl, "/v1/engines");
+    assert.equal(engines.body.active, "codeagent");
+    assert.deepEqual(
+      engines.body.engines.map((engine: any) => engine.name).sort(),
+      ["codeagent", "deepseek-harness", "opencode"],
+    );
+    const event = sse.events.find((candidate) => candidate.runId === openRun.body.runId);
+    assert.equal(event?.specVersion, "1.0");
+    assert.equal(event?.source, "multi-agent-gateway");
+  } finally {
+    await sse.close();
+    await closeServer(server);
+    await created.service.shutdown();
+  }
+});
+
+test("run status reflects Agent input and cancellation", async () => {
+  const created = createApp({
+    engine: "codeagent",
+    env: { ...process.env, CODEAGENT_PROTOCOL: "reference", LOG_LEVEL: "silent" },
+  });
+  const server = createServer(created.app);
+  server.listen(0, "127.0.0.1");
+  await once(server, "listening");
+  const address = server.address();
+  assert(address && typeof address === "object");
+  const baseUrl = `http://127.0.0.1:${address.port}`;
+  const sse = new SseClient();
+  try {
+    await sse.connect(`${baseUrl}/v1/events`);
+    const session = await requestJson(baseUrl, "/v1/sessions", {
+      method: "POST",
+      body: "{}",
+    });
+    const sessionId = session.body.session.id;
+    const asked = await requestJson(baseUrl, `/v1/sessions/${sessionId}/messages`, {
+      method: "POST",
+      body: JSON.stringify({ content: "[[ask:branch?]]" }),
+    });
+    const question = await sse.waitFor(
+      "interaction.question",
+      (event) => event.runId === asked.body.runId,
+    );
+    const waiting = await requestJson(baseUrl, `/v1/runs/${asked.body.runId}`);
+    assert.equal(waiting.body.run.status, "input_required");
+    await requestJson(
+      baseUrl,
+      `/v1/sessions/${sessionId}/interactions/${(question.data as any).requestId}/respond`,
+      { method: "POST", body: JSON.stringify({ answer: "main" }) },
+    );
+    await sse.waitFor("generation.completed", (event) => event.runId === asked.body.runId);
+    assert.equal((await requestJson(baseUrl, `/v1/runs/${asked.body.runId}`)).body.run.status, "completed");
+
+    const slow = await requestJson(baseUrl, `/v1/sessions/${sessionId}/messages`, {
+      method: "POST",
+      body: JSON.stringify({ content: "[[slow:5000]]" }),
+    });
+    await requestJson(baseUrl, `/v1/sessions/${sessionId}/stop`, { method: "POST", body: "{}" });
+    await sse.waitFor("generation.stopped", (event) => event.runId === slow.body.runId);
+    const canceled = await requestJson(baseUrl, `/v1/runs/${slow.body.runId}`);
+    assert.equal(canceled.body.run.status, "canceled");
+    assert.equal(canceled.body.run.stopReason, "user");
+    const missing = await requestJson(baseUrl, "/v1/runs/missing-run");
+    assert.equal(missing.status, 404);
+    assert.equal(missing.body.error.code, "RUN_NOT_FOUND");
+  } finally {
+    await sse.close();
+    await closeServer(server);
+    await created.service.shutdown();
+  }
+});
+
 test("an engine can be replaced by an external JSONL process bridge", async () => {
   const project = await fs.mkdtemp(path.join(os.tmpdir(), "gateway-bridge-project-"));
   const realProject = await fs.realpath(project);
@@ -350,6 +514,44 @@ test("an engine can be replaced by an external JSONL process bridge", async () =
     await sse.close();
     await closeServer(server);
     await fs.rm(project, { recursive: true, force: true });
+  }
+});
+
+test("a new protocol factory can add an Agent without changing gateway routes", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "gateway-plugin-protocol-"));
+  const configPath = path.join(root, "agents.json");
+  await fs.writeFile(configPath, JSON.stringify({
+    engines: {
+      "plugin-agent": {
+        protocol: "fixture-plugin",
+        command: "unused-by-fixture",
+        displayName: "Plugin Agent",
+      },
+    },
+  }));
+  registerEngineProtocol("fixture-plugin", (name, definition) =>
+    new ReferenceEngine(name, definition.displayName ?? name),
+  );
+  const created = createApp({
+    engine: "plugin-agent",
+    env: { ...process.env, AGENT_ENGINE_CONFIG: configPath, LOG_LEVEL: "silent" },
+  });
+  try {
+    const session = await created.service.createSession(root);
+    const run = created.service.sendMessage(session.id, "plugin route compatibility");
+    await waitForServiceEvent(
+      created.service.events,
+      "generation.completed",
+      (event) => event.runId === run.runId,
+    );
+    assert.equal(created.service.getSession(session.id).engine, "plugin-agent");
+    assert.match(
+      created.service.getSession(session.id).messages.at(-1)?.content ?? "",
+      /^Plugin Agent:/,
+    );
+  } finally {
+    await created.service.shutdown();
+    await fs.rm(root, { recursive: true, force: true });
   }
 });
 
