@@ -15,6 +15,7 @@ GatewayService compatibility facade
       +-- WorkspaceResolver (local workspace boundary)
       +-- SessionRepository (memory / SQLite)
       +-- RunRepository (memory / SQLite)
+      +-- InteractionRepository (memory / SQLite)
       +-- EventBus + EventRepository (memory / SQLite)
       |
       v
@@ -26,13 +27,13 @@ AgentEngine contract
       +-- reference engine for deterministic tests
 ```
 
-`GatewayService` 是协议无关的兼容门面，统一维护 Session、Run、交互请求、取消、超时、资源限制和权限策略。Engine Catalog 允许一个网关同时承载多个 Agent，`--engine` 只决定默认引擎。Adapter 不接触 HTTP，只把原生 Agent 消息映射成 `emitDelta`、`askQuestion`、`requestPermission` 和 `emitEvent`。
+`GatewayService` 是协议无关的兼容门面，统一维护 Session、Run、Interaction、FIFO 调度、取消、超时、资源限制和权限策略。Engine Catalog 允许一个网关同时承载多个 Agent，`--engine` 只决定默认引擎。Adapter 不接触 HTTP，只把原生 Agent 消息映射成 `emitDelta`、`askQuestion`、`requestPermission` 和 `emitEvent`。
 
-Run 是规范化执行实体，状态为 `queued | running | input_required | canceling | completed | failed | canceled`。现有 Session `idle | busy` 状态继续保留，作为 Run 状态的兼容投影。
+Run 是规范化执行实体，状态为 `queued | running | input_required | canceling | completed | failed | canceled`。达到并发上限后 Run 留在 FIFO 队列中，获得执行槽位后切换为 `running`；排队阶段也支持取消。现有 Session `idle | busy` 状态继续保留，作为 Run 状态的兼容投影。
 
 ## 会话和恢复
 
-每个逻辑 Session 记录 Agent、Workspace、项目真实路径、状态和消息。配置 `GATEWAY_DATABASE_PATH` 后使用 SQLite WAL 持久化 Session、Run 和事件；进程重启时遗留的 `busy` 会话恢复为 `idle`，未完成 Run 恢复为带 `GATEWAY_RESTARTED` 错误的 `failed`。
+每个逻辑 Session 记录 Agent、Workspace、项目真实路径、状态和消息。配置 `GATEWAY_DATABASE_PATH` 后使用 SQLite WAL 持久化 Session、Run、Interaction 和事件；进程重启时遗留的 `busy` 会话恢复为 `idle`，未完成 Run 恢复为带 `GATEWAY_RESTARTED` 错误的 `failed`，未回答 Interaction 标记为 `canceled` 并保留审计信息。
 
 SSE envelope 固定包含 `id`、`specVersion`、`source`、`type`、`timestamp` 和 `data`。SQLite 模式下事件 ID 跨重启单调递增，`Last-Event-ID` 可以继续回放保留窗口内的事件。事件契约见 [../asyncapi.yaml](../asyncapi.yaml)。
 

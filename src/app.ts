@@ -12,6 +12,10 @@ import { GatewayError } from "./errors.js";
 import { EventBus } from "./event-bus.js";
 import { createEventRepository, type EventRepository } from "./event-store.js";
 import { GatewayService } from "./gateway-service.js";
+import {
+  createInteractionRepository,
+  type InteractionRepository,
+} from "./interaction-store.js";
 import { GatewayMetrics } from "./metrics.js";
 import { createRunRepository, type RunRepository } from "./run-store.js";
 import { createSessionRepository, type SessionRepository } from "./session-store.js";
@@ -25,6 +29,7 @@ export interface AppOptions {
   config?: Partial<GatewayConfig>;
   repository?: SessionRepository;
   runRepository?: RunRepository;
+  interactionRepository?: InteractionRepository;
   eventRepository?: EventRepository;
 }
 
@@ -63,6 +68,9 @@ export function createApp(options: AppOptions = {}) {
   const events = new EventBus(config.eventHistoryLimit, eventRepository);
   const repository = options.repository ?? createSessionRepository(config.databasePath);
   const runRepository = options.runRepository ?? createRunRepository(config.databasePath);
+  const interactionRepository = options.interactionRepository ?? createInteractionRepository(
+    config.databasePath,
+  );
   const service = new GatewayService(
     engineCatalog,
     events,
@@ -77,6 +85,7 @@ export function createApp(options: AppOptions = {}) {
       permissionPolicy: config.permissionPolicy,
       repository,
       runRepository,
+      interactionRepository,
     },
   );
   const metrics = new GatewayMetrics(service);
@@ -252,8 +261,26 @@ export function createApp(options: AppOptions = {}) {
     response.json({ runs: service.listRuns(sessionId) });
   });
 
+  app.get("/v1/sessions/:sessionId/interactions", (request, response) => {
+    const sessionId = routeParam(request.params.sessionId, "sessionId");
+    response.json({ interactions: service.listInteractions(sessionId) });
+  });
+
+  app.get("/v1/runs/:runId/interactions", (request, response) => {
+    const runId = routeParam(request.params.runId, "runId");
+    response.json({ interactions: service.listRunInteractions(runId) });
+  });
+
   app.get("/v1/runs/:runId", (request, response) => {
     response.json({ run: service.getRun(routeParam(request.params.runId, "runId")) });
+  });
+
+  app.get("/v1/interactions/:interactionId", (request, response) => {
+    response.json({
+      interaction: service.getInteraction(
+        routeParam(request.params.interactionId, "interactionId"),
+      ),
+    });
   });
 
   app.use((_request, _response, next) => {

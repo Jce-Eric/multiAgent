@@ -6,6 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { createApp } from "../src/app.js";
+import { SqliteInteractionRepository } from "../src/interaction-store.js";
 import { SqliteRunRepository } from "../src/run-store.js";
 import { SqliteSessionRepository } from "../src/session-store.js";
 import type { EventBus } from "../src/event-bus.js";
@@ -175,14 +176,14 @@ test("API key protects v1 and metrics while health and readiness remain public",
   }
 });
 
-test("resource limits, generation timeout, and permission policy are enforced", async () => {
+test("run queue, resource limits, generation timeout, and permission policy are enforced", async () => {
   const { service } = createApp({
     engine: "codeagent",
     env: referenceEnv,
     config: {
       generationTimeoutMs: 25,
       maxConcurrentRuns: 1,
-      maxMessagesPerSession: 2,
+      maxMessagesPerSession: 4,
       maxSessions: 2,
       permissionPolicy: "allow",
     },
@@ -192,16 +193,19 @@ test("resource limits, generation timeout, and permission policy are enforced", 
     const second = await service.createSession();
     await assert.rejects(service.createSession(), (error: any) => error?.code === "RESOURCE_LIMIT");
     const slow = service.sendMessage(first.id, "[[slow:5000]]");
-    assert.throws(
-      () => service.sendMessage(second.id, "blocked by concurrency"),
-      (error: any) => error?.code === "RESOURCE_LIMIT",
-    );
+    const queued = service.sendMessage(second.id, "queued by concurrency");
+    assert.equal(service.getRun(queued.runId).status, "queued");
     const timedOut = await waitForEvent(
       service.events,
       "generation.failed",
       (event) => event.runId === slow.runId,
     );
     assert.equal((timedOut.data as any).code, "GENERATION_TIMEOUT");
+    await waitForEvent(
+      service.events,
+      "generation.completed",
+      (event) => event.runId === queued.runId,
+    );
 
     const permissionRun = service.sendMessage(second.id, "[[permission:write file]]");
     await waitForEvent(
@@ -219,6 +223,54 @@ test("resource limits, generation timeout, and permission policy are enforced", 
     );
   } finally {
     await service.shutdown();
+  }
+});
+
+test("SQLite persists resolved interactions and cancels orphaned pending interactions", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "gateway-interactions-"));
+  const databasePath = path.join(root, "gateway.db");
+  const env = { ...referenceEnv, GATEWAY_DATABASE_PATH: databasePath };
+  try {
+    const created = createApp({ engine: "codeagent", env });
+    const session = await created.service.createSession(root);
+    const run = created.service.sendMessage(session.id, "[[ask:branch?]]");
+    const question = await waitForEvent(
+      created.service.events,
+      "interaction.question",
+      (event) => event.runId === run.runId,
+    );
+    const interactionId = (question.data as any).requestId as string;
+    created.service.respondToInteraction(session.id, interactionId, { answer: "main" });
+    await waitForEvent(
+      created.service.events,
+      "generation.completed",
+      (event) => event.runId === run.runId,
+    );
+    assert.equal(created.service.getInteraction(interactionId).status, "resolved");
+    await created.service.shutdown();
+
+    const repository = new SqliteInteractionRepository(databasePath);
+    assert.equal(repository.get(interactionId).response && "answer" in repository.get(interactionId).response!, true);
+    const timestamp = new Date().toISOString();
+    repository.add({
+      id: "orphaned-interaction",
+      sessionId: session.id,
+      runId: run.runId,
+      type: "permission",
+      status: "pending",
+      data: { operation: "write file" },
+      createdAt: timestamp,
+      updatedAt: timestamp,
+    });
+    repository.close();
+
+    const reopened = new SqliteInteractionRepository(databasePath);
+    const orphaned = reopened.get("orphaned-interaction");
+    assert.equal(orphaned.status, "canceled");
+    assert.equal(orphaned.cancelReason, "GATEWAY_RESTARTED");
+    reopened.close();
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
   }
 });
 

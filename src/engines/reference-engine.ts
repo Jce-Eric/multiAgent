@@ -27,6 +27,7 @@ export class ReferenceEngine implements AgentEngine {
     const question = marker(prompt, "ask");
     const permission = marker(prompt, "permission");
     const errorMessage = marker(prompt, "error");
+    const errorAfterMessage = marker(prompt, "error-after");
     const slowValue = marker(prompt, "slow");
 
     if (errorMessage) {
@@ -35,6 +36,9 @@ export class ReferenceEngine implements AgentEngine {
 
     const parts: string[] = [`${this.displayName}: `];
     context.emitDelta(parts[0]);
+    if (errorAfterMessage) {
+      throw new Error(errorAfterMessage);
+    }
 
     if (slowValue) {
       const milliseconds = Math.max(10, Math.min(Number(slowValue) || 2_000, 30_000));
@@ -58,7 +62,9 @@ export class ReferenceEngine implements AgentEngine {
       context.emitDelta(text);
     }
 
-    const cleanPrompt = prompt.replace(/\[\[(ask|permission|slow|error):.*?\]\]/gs, "").trim();
+    const cleanPrompt = prompt
+      .replace(/\[\[(ask|permission|slow|error|error-after):.*?\]\]/gs, "")
+      .trim();
     const body = prompt.includes("[[pwd]]")
       ? `working directory is ${path.resolve(context.directory)}`
       : cleanPrompt || "done";

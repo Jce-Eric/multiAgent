@@ -2,7 +2,7 @@
 
 Date: 2026-09-06
 
-The v0.5 design was selected after ten independent review passes. The constraint for every pass was that existing clients must continue to create sessions, send messages, answer interactions, stop work, and consume SSE without engine-specific behavior.
+The v0.5 design was selected after ten independent review passes. The v0.6 iteration adds persisted Interaction resources and FIFO Run scheduling while preserving the same client workflows.
 
 ## Ten review passes
 
@@ -25,11 +25,13 @@ The v0.5 design was selected after ten independent review passes. The constraint
 - Existing `Message.content` remains supported; richer content is added through `Message.parts`.
 - Engine-native payloads remain under `agent.event` rather than changing core resources.
 - SQLite mode preserves sessions, Runs, and the SSE cursor across gateway restarts.
+- v0.6 persists Interaction audit records and cancels orphaned pending requests on restart.
+- v0.6 uses the existing `queued` Run state for FIFO admission instead of rejecting excess concurrency.
 
 ## Deferred work
 
 - Transactional outbox across Session, Run, Message, and Event writes.
-- Persisted Interaction resources and restartable human-in-the-loop execution.
+- Restartable human-in-the-loop execution using native Agent checkpoint handles.
 - Artifact storage and content-part upload APIs.
 - A2A remote driver and native checkpoint/resume handles.
 - PostgreSQL repositories, runtime ownership leases, and cross-instance event fanout.

@@ -95,6 +95,8 @@ export interface GatewayEvent<T = unknown> {
 
 export type InteractionType = "question" | "permission";
 
+export type InteractionStatus = "pending" | "resolved" | "canceled";
+
 export interface QuestionResponse {
   answer?: string;
   answers?: Record<string, string | number | boolean | string[]>;
@@ -103,4 +105,19 @@ export interface QuestionResponse {
 export interface PermissionResponse {
   decision?: "allow" | "deny";
   optionId?: string;
+}
+
+export interface Interaction {
+  id: string;
+  sessionId: string;
+  runId: string;
+  type: InteractionType;
+  status: InteractionStatus;
+  data: unknown;
+  response?: QuestionResponse | PermissionResponse;
+  resolvedBy?: "client" | "policy";
+  cancelReason?: string;
+  createdAt: string;
+  updatedAt: string;
+  resolvedAt?: string;
 }

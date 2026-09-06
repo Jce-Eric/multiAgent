@@ -14,6 +14,12 @@ export {
   type RunRepository,
 } from "./run-store.js";
 export {
+  MemoryInteractionRepository,
+  SqliteInteractionRepository,
+  createInteractionRepository,
+  type InteractionRepository,
+} from "./interaction-store.js";
+export {
   MemoryEventRepository,
   SqliteEventRepository,
   createEventRepository,
@@ -44,6 +50,9 @@ export type {
   GatewayEvent,
   GatewayEventType,
   Message,
+  Interaction,
+  InteractionStatus,
+  InteractionType,
   Run,
   RunStatus,
   Session,

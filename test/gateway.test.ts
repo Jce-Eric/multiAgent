@@ -450,13 +450,36 @@ test("run status reflects Agent input and cancellation", async () => {
     );
     const waiting = await requestJson(baseUrl, `/v1/runs/${asked.body.runId}`);
     assert.equal(waiting.body.run.status, "input_required");
+    const interactionId = (question.data as any).requestId;
+    const pendingInteraction = await requestJson(
+      baseUrl,
+      `/v1/interactions/${interactionId}`,
+    );
+    assert.equal(pendingInteraction.body.interaction.status, "pending");
+    assert.equal(pendingInteraction.body.interaction.type, "question");
+    const sessionInteractions = await requestJson(
+      baseUrl,
+      `/v1/sessions/${sessionId}/interactions`,
+    );
+    assert.equal(sessionInteractions.body.interactions[0].id, interactionId);
+    const runInteractions = await requestJson(
+      baseUrl,
+      `/v1/runs/${asked.body.runId}/interactions`,
+    );
+    assert.equal(runInteractions.body.interactions[0].id, interactionId);
     await requestJson(
       baseUrl,
-      `/v1/sessions/${sessionId}/interactions/${(question.data as any).requestId}/respond`,
+      `/v1/sessions/${sessionId}/interactions/${interactionId}/respond`,
       { method: "POST", body: JSON.stringify({ answer: "main" }) },
     );
     await sse.waitFor("generation.completed", (event) => event.runId === asked.body.runId);
     assert.equal((await requestJson(baseUrl, `/v1/runs/${asked.body.runId}`)).body.run.status, "completed");
+    const resolvedInteraction = await requestJson(
+      baseUrl,
+      `/v1/interactions/${interactionId}`,
+    );
+    assert.equal(resolvedInteraction.body.interaction.status, "resolved");
+    assert.equal(resolvedInteraction.body.interaction.resolvedBy, "client");
 
     const slow = await requestJson(baseUrl, `/v1/sessions/${sessionId}/messages`, {
       method: "POST",
@@ -473,6 +496,76 @@ test("run status reflects Agent input and cancellation", async () => {
   } finally {
     await sse.close();
     await closeServer(server);
+    await created.service.shutdown();
+  }
+});
+
+test("runs queue in FIFO order and a queued run can be canceled", async () => {
+  const created = createApp({
+    engine: "codeagent",
+    env: { ...process.env, CODEAGENT_PROTOCOL: "reference", LOG_LEVEL: "silent" },
+    config: { maxConcurrentRuns: 1 },
+  });
+  try {
+    const firstSession = await created.service.createSession();
+    const secondSession = await created.service.createSession();
+    const first = created.service.sendMessage(firstSession.id, "[[slow:5000]] first");
+    await waitForServiceEvent(
+      created.service.events,
+      "generation.started",
+      (event) => event.runId === first.runId,
+    );
+    const second = created.service.sendMessage(secondSession.id, "second");
+    assert.equal(created.service.getRun(second.runId).status, "queued");
+    assert.equal(created.service.getSession(secondSession.id).status, "busy");
+
+    const stopped = created.service.stopSession(secondSession.id);
+    assert.equal(stopped.runId, second.runId);
+    await waitForServiceEvent(
+      created.service.events,
+      "generation.stopped",
+      (event) => event.runId === second.runId,
+    );
+    assert.equal(created.service.getRun(second.runId).status, "canceled");
+    assert.equal(created.service.getSession(secondSession.id).status, "idle");
+    assert.equal(
+      created.service.events.eventsAfter(0).some(
+        (event) => event.type === "generation.started" && event.runId === second.runId,
+      ),
+      false,
+    );
+    created.service.stopSession(firstSession.id);
+    await waitForServiceEvent(
+      created.service.events,
+      "generation.stopped",
+      (event) => event.runId === first.runId,
+    );
+  } finally {
+    await created.service.shutdown();
+  }
+});
+
+test("engine failures persist partial assistant output", async () => {
+  const created = createApp({
+    engine: "codeagent",
+    env: { ...process.env, CODEAGENT_PROTOCOL: "reference", LOG_LEVEL: "silent" },
+  });
+  try {
+    const session = await created.service.createSession();
+    const run = created.service.sendMessage(session.id, "[[error-after:provider failed]]");
+    await waitForServiceEvent(
+      created.service.events,
+      "generation.failed",
+      (event) => event.runId === run.runId,
+    );
+    const failed = created.service.getRun(run.runId);
+    const restored = created.service.getSession(session.id);
+    assert.equal(failed.status, "failed");
+    assert.equal(failed.error?.message, "provider failed");
+    assert.equal(restored.messages.at(-1)?.status, "stopped");
+    assert.equal(restored.messages.at(-1)?.content, "CodeAgent: ");
+    assert.equal(failed.outputMessageId, restored.messages.at(-1)?.id);
+  } finally {
     await created.service.shutdown();
   }
 });

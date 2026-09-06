@@ -54,7 +54,10 @@ POST   /v1/sessions/:sessionId/messages
 POST   /v1/sessions/:sessionId/interactions/:requestId/respond
 POST   /v1/sessions/:sessionId/stop
 GET    /v1/sessions/:sessionId/runs
+GET    /v1/sessions/:sessionId/interactions
 GET    /v1/runs/:runId
+GET    /v1/runs/:runId/interactions
+GET    /v1/interactions/:interactionId
 ```
 
 完整契约见 [openapi.yaml](openapi.yaml)。架构与扩展方式见 [docs/architecture.md](docs/architecture.md)。
@@ -76,7 +79,7 @@ curl -X POST http://127.0.0.1:3000/v1/sessions \
   -d '{"directory":"/absolute/project/path","engine":"opencode"}'
 ```
 
-发送消息后立即返回 `runId`，可通过 `/v1/runs/:runId` 查询规范化运行状态：
+发送消息后立即返回 `runId`，可通过 `/v1/runs/:runId` 查询规范化运行状态。达到并发上限时 Run 保持 `queued`，网关会按 FIFO 顺序自动调度，不需要客户端重试：
 
 ```bash
 curl -X POST http://127.0.0.1:3000/v1/sessions/SESSION_ID/messages \
@@ -106,6 +109,13 @@ curl -N 'http://127.0.0.1:3000/v1/events?sessionId=SESSION_ID'
 {"optionId":"acceptForSession"}
 ```
 
+Interaction 是可查询的持久化资源：
+
+```bash
+curl http://127.0.0.1:3000/v1/interactions/INTERACTION_ID
+curl http://127.0.0.1:3000/v1/sessions/SESSION_ID/interactions
+```
+
 错误格式固定包含错误码、描述和请求 ID：
 
 ```json
@@ -120,13 +130,13 @@ curl -N 'http://127.0.0.1:3000/v1/events?sessionId=SESSION_ID'
 
 ## 持久化与恢复
 
-默认使用内存仓储。配置 SQLite 后，Session、消息、Run 和 SSE 事件在服务重启后保留：
+默认使用内存仓储。配置 SQLite 后，Session、消息、Run、Interaction 和 SSE 事件在服务重启后保留：
 
 ```bash
 GATEWAY_DATABASE_PATH=./data/gateway.db npm start -- --engine opencode
 ```
 
-SQLite 使用 WAL。重启时遗留的 `busy` Session 会恢复为 `idle`，未完成 Run 会恢复为 `failed`。原生 Agent 进程被空闲回收或服务重启后，下一次生成会创建新原生 Session，并用已保存消息做一次上下文回放。
+SQLite 使用 WAL。重启时遗留的 `busy` Session 会恢复为 `idle`，未完成 Run 会恢复为 `failed`，未回答的 Interaction 会标记为 `canceled`。原生 Agent 进程被空闲回收或服务重启后，下一次生成会创建新原生 Session，并用已保存消息做一次上下文回放。
 
 ## 安全和资源策略
 
@@ -144,7 +154,7 @@ npm start -- --engine codeagent
 | 环境变量 | 默认值 | 说明 |
 | --- | --- | --- |
 | `MAX_SESSIONS` | `100` | 网关最大逻辑 Session 数 |
-| `MAX_CONCURRENT_RUNS` | `10` | 全局同时生成数 |
+| `MAX_CONCURRENT_RUNS` | `10` | 全局同时运行数，超过后进入 FIFO 队列 |
 | `MAX_MESSAGES_PER_SESSION` | `200` | 单 Session 最大消息数 |
 | `GENERATION_TIMEOUT_MS` | `600000` | 单次生成超时，`0` 禁用 |
 | `IDLE_SESSION_TIMEOUT_MS` | `300000` | 原生进程空闲回收时间，`0` 禁用 |

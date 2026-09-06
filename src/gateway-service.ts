@@ -2,10 +2,15 @@ import { randomUUID } from "node:crypto";
 import type { PermissionPolicy } from "./config.js";
 import { EventBus } from "./event-bus.js";
 import { AbortGenerationError, GatewayError, isAbortError } from "./errors.js";
+import {
+  MemoryInteractionRepository,
+  type InteractionRepository,
+} from "./interaction-store.js";
 import { MemoryRunRepository, type RunRepository } from "./run-store.js";
 import { MemorySessionRepository, type SessionRepository } from "./session-store.js";
 import type {
   InteractionType,
+  Interaction,
   Message,
   PermissionResponse,
   QuestionResponse,
@@ -27,8 +32,7 @@ type InteractionResponse = QuestionResponse | PermissionResponse;
 type AbortReason = "user" | "timeout" | "shutdown";
 
 interface PendingInteraction {
-  id: string;
-  type: InteractionType;
+  record: Interaction;
   value: Deferred<InteractionResponse>;
 }
 
@@ -38,6 +42,8 @@ interface ActiveRun {
   controller: AbortController;
   interactions: Map<string, PendingInteraction>;
   finished: Deferred<void>;
+  prompt: string;
+  started: boolean;
   abortReason?: AbortReason;
   timeout?: NodeJS.Timeout;
 }
@@ -52,12 +58,14 @@ export interface GatewayServiceOptions {
   permissionPolicy?: PermissionPolicy;
   repository?: SessionRepository;
   runRepository?: RunRepository;
+  interactionRepository?: InteractionRepository;
   workspaceResolver?: WorkspaceResolver;
 }
 
 export class GatewayService {
   readonly repository: SessionRepository;
   readonly runs: RunRepository;
+  readonly interactions: InteractionRepository;
   readonly engine: AgentEngine;
   readonly engineCatalog: EngineCatalogLike;
   private readonly activeRuns = new Map<string, ActiveRun>();
@@ -81,6 +89,7 @@ export class GatewayService {
     this.engine = this.engineCatalog.get(this.engineCatalog.defaultEngineName);
     this.repository = options.repository ?? new MemorySessionRepository();
     this.runs = options.runRepository ?? new MemoryRunRepository();
+    this.interactions = options.interactionRepository ?? new MemoryInteractionRepository();
     this.workspaceResolver = options.workspaceResolver ?? new WorkspaceResolver(
       defaultDirectory,
       options.allowedRoots ?? [],
@@ -153,6 +162,24 @@ export class GatewayService {
     return this.runs.listForSession(sessionId).map((run) => this.snapshotRun(run));
   }
 
+  getInteraction(id: string): Interaction {
+    return this.snapshotInteraction(this.interactions.get(id));
+  }
+
+  listInteractions(sessionId: string): Interaction[] {
+    this.repository.get(sessionId);
+    return this.interactions.listForSession(sessionId).map((interaction) =>
+      this.snapshotInteraction(interaction),
+    );
+  }
+
+  listRunInteractions(runId: string): Interaction[] {
+    this.runs.get(runId);
+    return this.interactions.listForRun(runId).map((interaction) =>
+      this.snapshotInteraction(interaction),
+    );
+  }
+
   listEngines(): EngineDescriptor[] {
     return this.engineCatalog.descriptors();
   }
@@ -161,8 +188,12 @@ export class GatewayService {
     const session = this.repository.get(id);
     const run = this.activeRuns.get(id);
     if (run) {
-      this.setRunStatus(run.record, "canceling");
-      this.abortRun(run, "user");
+      if (run.started) {
+        this.setRunStatus(run.record, "canceling");
+        this.abortRun(run, "user");
+      } else {
+        this.cancelQueuedRun(session, run, "user");
+      }
       await run.finished.promise;
     }
     this.clearIdleTimer(id);
@@ -177,13 +208,6 @@ export class GatewayService {
     const engine = this.engineCatalog.get(session.engine);
     if (session.status === "busy") {
       throw new GatewayError(409, "SESSION_BUSY", `Session '${sessionId}' is already busy`);
-    }
-    if (this.activeRuns.size >= this.maxConcurrentRuns) {
-      throw new GatewayError(
-        429,
-        "RESOURCE_LIMIT",
-        `Concurrent generation limit of ${this.maxConcurrentRuns} reached`,
-      );
     }
     if (session.messages.length + 2 > this.maxMessagesPerSession) {
       throw new GatewayError(
@@ -203,7 +227,7 @@ export class GatewayService {
       id: randomUUID(),
       sessionId,
       engine: engine.name,
-      status: "running",
+      status: "queued",
       createdAt: timestamp,
       updatedAt: timestamp,
     };
@@ -214,21 +238,14 @@ export class GatewayService {
       controller: new AbortController(),
       interactions: new Map(),
       finished: deferred<void>(),
+      prompt: content,
+      started: false,
     };
-    if (this.generationTimeoutMs > 0) {
-      run.timeout = setTimeout(() => this.abortRun(run, "timeout"), this.generationTimeoutMs);
-      run.timeout.unref();
-    }
     this.activeRuns.set(sessionId, run);
     this.setStatus(session, "busy", record.id);
     this.events.publish("message.user", userMessage, { sessionId, runId: record.id });
     this.events.publish("run.created", this.snapshotRun(record), { sessionId, runId: record.id });
-    this.events.publish(
-      "generation.started",
-      { engine: engine.name, directory: session.directory },
-      { sessionId, runId: record.id },
-    );
-    void this.executeRun(session, run, content);
+    this.drainRunQueue();
     return { runId: record.id };
   }
 
@@ -241,18 +258,42 @@ export class GatewayService {
     const run = this.activeRuns.get(sessionId);
     const interaction = run?.interactions.get(requestId);
     if (!run || !interaction) {
+      let stored: Interaction;
+      try {
+        stored = this.interactions.get(requestId);
+      } catch {
+        throw new GatewayError(
+          404,
+          "INTERACTION_NOT_FOUND",
+          `Interaction '${requestId}' was not found`,
+        );
+      }
+      if (stored.sessionId === sessionId && stored.status !== "pending") {
+        throw new GatewayError(
+          409,
+          "INTERACTION_NOT_PENDING",
+          `Interaction '${requestId}' is already ${stored.status}`,
+        );
+      }
       throw new GatewayError(
         404,
         "INTERACTION_NOT_FOUND",
         `Interaction '${requestId}' was not found`,
       );
     }
-    this.validateInteractionResponse(interaction.type, response);
+    this.validateInteractionResponse(interaction.record.type, response);
     run.interactions.delete(requestId);
+    this.resolveInteraction(interaction.record, response, "client");
     interaction.value.resolve(response);
     this.events.publish(
       "interaction.resolved",
-      { requestId, interactionType: interaction.type, response },
+      {
+        requestId,
+        interactionType: interaction.record.type,
+        status: "resolved",
+        response,
+        resolvedBy: "client",
+      },
       { sessionId, runId: run.record.id },
     );
     if (run.interactions.size === 0 && !run.controller.signal.aborted) {
@@ -266,18 +307,27 @@ export class GatewayService {
     if (!run || session.status !== "busy") {
       throw new GatewayError(409, "SESSION_IDLE", `Session '${sessionId}' is not generating`);
     }
+    if (!run.started) {
+      this.cancelQueuedRun(session, run, "user");
+      return { runId: run.record.id };
+    }
     this.setRunStatus(run.record, "canceling");
     this.abortRun(run, "user");
     return { runId: run.record.id };
   }
 
   isReady(): boolean {
-    return !this.shuttingDown && this.repository.health() && this.runs.health() && this.events.health();
+    return !this.shuttingDown &&
+      this.repository.health() &&
+      this.runs.health() &&
+      this.interactions.health() &&
+      this.events.health();
   }
 
-  stats(): { activeRuns: number; sessions: number; shuttingDown: boolean } {
+  stats(): { activeRuns: number; queuedRuns: number; sessions: number; shuttingDown: boolean } {
     return {
-      activeRuns: this.activeRuns.size,
+      activeRuns: this.runningRunCount(),
+      queuedRuns: [...this.activeRuns.values()].filter((run) => !run.started).length,
       sessions: this.repository.list().length,
       shuttingDown: this.shuttingDown,
     };
@@ -288,9 +338,14 @@ export class GatewayService {
     this.shuttingDown = true;
     for (const timer of this.idleTimers.values()) clearTimeout(timer);
     this.idleTimers.clear();
-    for (const run of this.activeRuns.values()) {
-      this.setRunStatus(run.record, "canceling");
-      this.abortRun(run, "shutdown");
+    for (const run of [...this.activeRuns.values()]) {
+      if (run.started) {
+        this.setRunStatus(run.record, "canceling");
+        this.abortRun(run, "shutdown");
+      } else {
+        const session = this.repository.get(run.record.sessionId);
+        this.cancelQueuedRun(session, run, "shutdown");
+      }
     }
     await Promise.allSettled([...this.activeRuns.values()].map((run) => run.finished.promise));
     await Promise.allSettled(
@@ -300,13 +355,14 @@ export class GatewayService {
     );
     this.repository.close();
     this.runs.close();
+    this.interactions.close();
     this.events.close();
   }
 
-  private async executeRun(session: Session, run: ActiveRun, prompt: string): Promise<void> {
+  private async executeRun(session: Session, run: ActiveRun): Promise<void> {
     let accumulated = "";
     try {
-      const result = await run.engine.generate(prompt, {
+      const result = await run.engine.generate(run.prompt, {
         sessionId: session.id,
         runId: run.record.id,
         directory: session.directory,
@@ -398,6 +454,17 @@ export class GatewayService {
         );
       } else {
         const normalized = this.normalizeEngineError(error);
+        if (accumulated) {
+          const message = this.createMessage("assistant", accumulated, "stopped");
+          session.messages.push(message);
+          session.updatedAt = now();
+          this.repository.save(session);
+          this.events.publish("message.assistant.completed", message, {
+            sessionId: session.id,
+            runId: run.record.id,
+          });
+          run.record.outputMessageId = message.id;
+        }
         this.setRunStatus(run.record, "failed", { error: normalized });
         this.events.publish("error", normalized, { sessionId: session.id, runId: run.record.id });
         this.events.publish("generation.failed", normalized, {
@@ -408,6 +475,7 @@ export class GatewayService {
     } finally {
       if (run.timeout) clearTimeout(run.timeout);
       for (const interaction of run.interactions.values()) {
+        this.cancelInteraction(interaction.record, run.abortReason ?? "run_ended");
         interaction.value.reject(new AbortGenerationError());
       }
       run.interactions.clear();
@@ -417,6 +485,7 @@ export class GatewayService {
       this.setStatus(session, "idle", run.record.id);
       this.scheduleIdleClose(session.id);
       run.finished.resolve();
+      this.drainRunQueue();
     }
   }
 
@@ -425,16 +494,19 @@ export class GatewayService {
     run: ActiveRun,
     input: QuestionInput,
   ): Promise<QuestionResponse> {
-    const interaction = this.registerInteraction(run, "question");
+    const data = {
+      question: input.question,
+      choices: input.choices,
+      schema: input.schema,
+      metadata: input.metadata,
+    };
+    const interaction = this.registerInteraction(session, run, "question", data);
     this.setRunStatus(run.record, "input_required");
     this.events.publish(
       "interaction.question",
       {
-        requestId: interaction.id,
-        question: input.question,
-        choices: input.choices,
-        schema: input.schema,
-        metadata: input.metadata,
+        requestId: interaction.record.id,
+        ...data,
       },
       { sessionId: session.id, runId: run.record.id },
     );
@@ -446,28 +518,33 @@ export class GatewayService {
     run: ActiveRun,
     input: PermissionInput,
   ): Promise<PermissionResponse> {
-    const interaction = this.registerInteraction(run, "permission");
+    const data = {
+      operation: input.operation,
+      reason: input.reason,
+      options: input.options,
+      metadata: input.metadata,
+    };
+    const interaction = this.registerInteraction(session, run, "permission", data);
     this.setRunStatus(run.record, "input_required");
     this.events.publish(
       "interaction.permission",
       {
-        requestId: interaction.id,
-        operation: input.operation,
-        reason: input.reason,
-        options: input.options,
-        metadata: input.metadata,
+        requestId: interaction.record.id,
+        ...data,
       },
       { sessionId: session.id, runId: run.record.id },
     );
     if (this.permissionPolicy !== "client") {
       const response: PermissionResponse = { decision: this.permissionPolicy };
-      run.interactions.delete(interaction.id);
+      run.interactions.delete(interaction.record.id);
+      this.resolveInteraction(interaction.record, response, "policy");
       interaction.value.resolve(response);
       this.events.publish(
         "interaction.resolved",
         {
-          requestId: interaction.id,
+          requestId: interaction.record.id,
           interactionType: "permission",
+          status: "resolved",
           response,
           resolvedBy: "policy",
         },
@@ -478,14 +555,30 @@ export class GatewayService {
     return interaction.value.promise as Promise<PermissionResponse>;
   }
 
-  private registerInteraction(run: ActiveRun, type: InteractionType): PendingInteraction {
+  private registerInteraction(
+    session: Session,
+    run: ActiveRun,
+    type: InteractionType,
+    data: unknown,
+  ): PendingInteraction {
     if (run.controller.signal.aborted) throw new AbortGenerationError();
-    const interaction: PendingInteraction = {
+    const timestamp = now();
+    const record: Interaction = {
       id: randomUUID(),
+      sessionId: session.id,
+      runId: run.record.id,
       type,
+      status: "pending",
+      data,
+      createdAt: timestamp,
+      updatedAt: timestamp,
+    };
+    const interaction: PendingInteraction = {
+      record,
       value: deferred<InteractionResponse>(),
     };
-    run.interactions.set(interaction.id, interaction);
+    this.interactions.add(record);
+    run.interactions.set(record.id, interaction);
     return interaction;
   }
 
@@ -527,6 +620,7 @@ export class GatewayService {
     run.abortReason = reason;
     run.controller.abort();
     for (const interaction of run.interactions.values()) {
+      this.cancelInteraction(interaction.record, reason);
       interaction.value.reject(new AbortGenerationError());
     }
     run.interactions.clear();
@@ -542,6 +636,83 @@ export class GatewayService {
       sessionId: session.id,
       runId,
     });
+  }
+
+  private drainRunQueue(): void {
+    if (this.shuttingDown) return;
+    for (const run of this.activeRuns.values()) {
+      if (this.runningRunCount() >= this.maxConcurrentRuns) return;
+      if (run.started || run.record.status !== "queued") continue;
+      const session = this.repository.get(run.record.sessionId);
+      run.started = true;
+      if (this.generationTimeoutMs > 0) {
+        run.timeout = setTimeout(() => this.abortRun(run, "timeout"), this.generationTimeoutMs);
+        run.timeout.unref();
+      }
+      this.setRunStatus(run.record, "running");
+      this.events.publish(
+        "generation.started",
+        { engine: run.engine.name, directory: session.directory },
+        { sessionId: session.id, runId: run.record.id },
+      );
+      void this.executeRun(session, run);
+    }
+  }
+
+  private cancelQueuedRun(session: Session, run: ActiveRun, reason: AbortReason): void {
+    if (run.started || run.record.status !== "queued") return;
+    run.abortReason = reason;
+    this.setRunStatus(run.record, "canceling");
+    run.controller.abort();
+    this.setRunStatus(run.record, "canceled", { stopReason: reason });
+    this.events.publish(
+      "generation.stopped",
+      { partialContent: "", reason },
+      { sessionId: session.id, runId: run.record.id },
+    );
+    this.activeRuns.delete(session.id);
+    this.setStatus(session, "idle", run.record.id);
+    this.scheduleIdleClose(session.id);
+    run.finished.resolve();
+    this.drainRunQueue();
+  }
+
+  private runningRunCount(): number {
+    return [...this.activeRuns.values()].filter((run) => run.started).length;
+  }
+
+  private resolveInteraction(
+    interaction: Interaction,
+    response: InteractionResponse,
+    resolvedBy: "client" | "policy",
+  ): void {
+    const timestamp = now();
+    interaction.status = "resolved";
+    interaction.response = response;
+    interaction.resolvedBy = resolvedBy;
+    interaction.updatedAt = timestamp;
+    interaction.resolvedAt = timestamp;
+    this.interactions.save(interaction);
+  }
+
+  private cancelInteraction(interaction: Interaction, reason: string): void {
+    if (interaction.status !== "pending") return;
+    const timestamp = now();
+    interaction.status = "canceled";
+    interaction.cancelReason = reason;
+    interaction.updatedAt = timestamp;
+    interaction.resolvedAt = timestamp;
+    this.interactions.save(interaction);
+    this.events.publish(
+      "interaction.resolved",
+      {
+        requestId: interaction.id,
+        interactionType: interaction.type,
+        status: "canceled",
+        cancelReason: reason,
+      },
+      { sessionId: interaction.sessionId, runId: interaction.runId },
+    );
   }
 
   private setRunStatus(
@@ -634,6 +805,14 @@ export class GatewayService {
     return {
       ...run,
       ...(run.error ? { error: { ...run.error } } : {}),
+    };
+  }
+
+  private snapshotInteraction(interaction: Interaction): Interaction {
+    return {
+      ...interaction,
+      data: structuredClone(interaction.data),
+      ...(interaction.response ? { response: structuredClone(interaction.response) } : {}),
     };
   }
 

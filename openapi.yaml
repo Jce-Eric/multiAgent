@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: Multi-Agent Gateway API
-  version: 0.5.0
+  version: 0.6.0
   description: Unified sessions, messages, interactions, cancellation, and SSE events for replaceable coding agents.
 servers:
   - url: http://127.0.0.1:3000
@@ -173,7 +173,7 @@ paths:
                 content: { type: string, minLength: 1 }
       responses:
         "202":
-          description: Generation accepted; subscribe to SSE for updates
+          description: Generation accepted in queued or running state; subscribe to SSE for updates
           content:
             application/json:
               schema: { $ref: "#/components/schemas/RunAccepted" }
@@ -201,6 +201,7 @@ paths:
         "202": { description: Interaction response accepted }
         "400": { $ref: "#/components/responses/Error" }
         "404": { $ref: "#/components/responses/Error" }
+        "409": { $ref: "#/components/responses/Error" }
   /v1/sessions/{sessionId}/stop:
     parameters:
       - $ref: "#/components/parameters/SessionId"
@@ -230,6 +231,22 @@ paths:
                 properties:
                   runs: { type: array, items: { $ref: "#/components/schemas/Run" } }
         "404": { $ref: "#/components/responses/Error" }
+  /v1/sessions/{sessionId}/interactions:
+    parameters:
+      - $ref: "#/components/parameters/SessionId"
+    get:
+      summary: List persisted interactions for a session
+      responses:
+        "200":
+          description: Interactions in reverse creation order
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [interactions]
+                properties:
+                  interactions: { type: array, items: { $ref: "#/components/schemas/Interaction" } }
+        "404": { $ref: "#/components/responses/Error" }
   /v1/runs/{runId}:
     parameters:
       - in: path
@@ -248,6 +265,44 @@ paths:
                 required: [run]
                 properties:
                   run: { $ref: "#/components/schemas/Run" }
+        "404": { $ref: "#/components/responses/Error" }
+  /v1/runs/{runId}/interactions:
+    parameters:
+      - in: path
+        name: runId
+        required: true
+        schema: { type: string }
+    get:
+      summary: List persisted interactions for a run
+      responses:
+        "200":
+          description: Interactions in reverse creation order
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [interactions]
+                properties:
+                  interactions: { type: array, items: { $ref: "#/components/schemas/Interaction" } }
+        "404": { $ref: "#/components/responses/Error" }
+  /v1/interactions/{interactionId}:
+    parameters:
+      - in: path
+        name: interactionId
+        required: true
+        schema: { type: string }
+    get:
+      summary: Get a persisted interaction
+      responses:
+        "200":
+          description: Interaction snapshot
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [interaction]
+                properties:
+                  interaction: { $ref: "#/components/schemas/Interaction" }
         "404": { $ref: "#/components/responses/Error" }
 components:
   securitySchemes:
@@ -366,6 +421,25 @@ components:
             code: { type: string }
             message: { type: string }
             details: {}
+    Interaction:
+      type: object
+      required: [id, sessionId, runId, type, status, data, createdAt, updatedAt]
+      properties:
+        id: { type: string }
+        sessionId: { type: string }
+        runId: { type: string }
+        type: { type: string, enum: [question, permission] }
+        status: { type: string, enum: [pending, resolved, canceled] }
+        data: {}
+        response:
+          oneOf:
+            - $ref: "#/components/schemas/QuestionResponse"
+            - $ref: "#/components/schemas/PermissionResponse"
+        resolvedBy: { type: string, enum: [client, policy] }
+        cancelReason: { type: string }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+        resolvedAt: { type: string, format: date-time }
     RunAccepted:
       type: object
       required: [runId]
